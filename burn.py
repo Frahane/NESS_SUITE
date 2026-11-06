@@ -139,7 +139,7 @@ def _issue_view_session(public_token: str) -> str:
     return tok
 
 
-def _view_session_ok(view_token: str, public_token: str) -> bool:
+def _view_session_ok(view_token: str, public_token: str, *, finishing_pack=False) -> bool:
     if not view_token:
         return False
     _purge_view_sessions()
@@ -149,26 +149,25 @@ def _view_session_ok(view_token: str, public_token: str) -> bool:
             return False
         if rec.get("drop") != public_token:
             return False
-        if rec.get("exp", 0) < time.time():
+        if rec.get("exp", 0) <= time.time():
+            return False
+        if finishing_pack and not rec.get("finishes_pack"):
             return False
         # Sliding window — extend on successful use
         rec["exp"] = time.time() + _VIEW_SESSION_TTL
         return True
 
 
-def _charge_download_once(db, row, view_token: str, public_token: str):
-    """Commit one quota claim per session; return (None, False) if unavailable.
+class _DownloadSessionRequired(Exception):
+    """A multi-file pack needs a verified session to claim its final unit."""
 
-    Hold the session lock until the SQLite transaction commits so parallel
-    requests cannot reuse an uncommitted claim. Passwordless requests retain
-    the same-client two-minute coalescing window.
 
-    When the claim exhausts max_downloads (or burn_after), status becomes
-    'burned' so *new* sessions are refused. The charging session may still
-    finish every file in the pack: a dl_charged session is allowed to read
-    while status is 'burned' and files remain on disk. Filesystem removal is
-    decided by the download handler (single-file / burn_after → immediate;
-    multi-file pack → deferred to cleanup after the session finishes).
+def _charge_download_once(db, row, view_token: str, public_token: str, *, multi_file=False):
+    """Return (charged count, destroy now), or (None, False) if unavailable.
+
+    Publish a session's claim after SQLite commits. Only the valid unlock
+    session that exhausts a multi-file pack can continue after quota closes.
+    Tokenless requests retain the two-minute client window while quota is open.
     """
     session_key = view_token
     if not view_token:
@@ -182,35 +181,40 @@ def _charge_download_once(db, row, view_token: str, public_token: str):
     with _VIEW_SESSIONS_LOCK:
         now = time.time()
         rec = _VIEW_SESSIONS.get(session_key)
-        if rec and (rec.get("drop") != public_token or
-                    (not view_token and rec.get("exp", 0) <= now)):
+        if rec and (rec.get("drop") != public_token or rec.get("exp", 0) <= now):
             rec = None
-
-        if rec and rec.get("dl_charged"):
-            # Session already paid its unit — allow remaining files even if
-            # status is burned (quota closed for everyone else).
-            current = db.execute(
-                """SELECT download_count, status FROM burn_drops WHERE id = ?""",
-                (row["id"],),
-            ).fetchone()
-            if not current:
-                return None, False
-            st = (current["status"] or "").lower()
-            if st == "active":
-                return int(current["download_count"]), False
-            if st == "burned":
-                return int(current["download_count"]), False
+        if view_token and rec is None:
             return None, False
 
+        if rec and rec.get("dl_charged"):
+            current = db.execute(
+                """SELECT download_count FROM burn_drops WHERE id = ?
+                     AND julianday(expires_at) > julianday('now')
+                     AND ((status = 'active' AND download_count < max_downloads)
+                          OR (status = 'burned' AND ? AND files_json <> '[]'))""",
+                (row["id"], bool(view_token and rec.get("finishes_pack"))),
+            ).fetchone()
+            return (int(current["download_count"]), False) if current else (None, False)
+
+        allow_final_claim = bool(view_token) or not multi_file
         try:
             claim = db.execute(
                 """UPDATE burn_drops SET download_count = download_count + 1
                    WHERE id = ? AND status = 'active'
                      AND download_count < max_downloads
+                     AND (? OR burn_after <> 0 OR download_count < max_downloads - 1)
                      AND julianday(expires_at) > julianday('now')""",
-                (row["id"],),
+                (row["id"], allow_final_claim),
             )
             if claim.rowcount != 1:
+                if not allow_final_claim and db.execute(
+                    """SELECT 1 FROM burn_drops
+                       WHERE id = ? AND status = 'active' AND burn_after = 0
+                         AND download_count = max_downloads - 1
+                         AND julianday(expires_at) > julianday('now')""",
+                    (row["id"],),
+                ).fetchone():
+                    raise _DownloadSessionRequired
                 db.rollback()
                 return None, False
             current = db.execute(
@@ -230,22 +234,18 @@ def _charge_download_once(db, row, view_token: str, public_token: str):
             db.rollback()
             raise
 
-        if not view_token:
+        finishes_pack = bool(view_token and multi_file and closed and not current["burn_after"])
+        if view_token:
+            rec["dl_charged"] = True
+            rec["finishes_pack"] = finishes_pack
+        else:
             _VIEW_SESSIONS[session_key] = {
                 "drop": public_token,
                 "exp": now + 120,
                 "dl_charged": True,
             }
-        elif rec:
-            rec["dl_charged"] = True
-        else:
-            _VIEW_SESSIONS[session_key] = {
-                "drop": public_token,
-                "exp": now + _VIEW_SESSION_TTL,
-                "dl_charged": True,
-            }
 
-        return new_count, closed
+        return new_count, closed and not finishes_pack
 
 
 
@@ -482,7 +482,18 @@ def cleanup_burn_expired():
                OR (status IN ('burned', 'expired') AND files_json <> '[]')""",
             (now,),
         ).fetchall()
+        # Take the session snapshot after reading the rows. The claim holds
+        # this lock from the SQLite update through session-marker publication.
+        with _VIEW_SESSIONS_LOCK:
+            session_now = time.time()
+            finishing = {
+                rec["drop"] for rec in _VIEW_SESSIONS.values()
+                if rec.get("finishes_pack") and rec.get("exp", 0) > session_now
+            }
         for row in rows:
+            if (row["status"] == "burned" and row["expires_at"] > now
+                    and row["public_token"] in finishing):
+                continue
             _destroy_drop(conn, row)
             if row["status"] != "burned":
                 conn.execute(
@@ -1086,14 +1097,8 @@ def _mount_routes(app, deps):
         row = db.execute(
             "SELECT * FROM burn_drops WHERE public_token = ?", (token,)
         ).fetchone()
-        if not row or row["status"] != "active":
+        if not row or row["status"] not in ("active", "burned"):
             return jsonify({"success": False, "error": "Drop not found"}), 404
-        exp = datetime.fromisoformat(row["expires_at"])
-        if exp <= datetime.now(timezone.utc):
-            _destroy_drop(db, row)
-            return jsonify({"success": False, "error": "Expired"}), 410
-        if row["download_count"] >= row["max_downloads"]:
-            return jsonify({"success": False, "error": "Access limit reached"}), 410
 
         # Passwords only via POST /unlock → view_token. Never accept ?password=.
         view_token = ""
@@ -1105,14 +1110,20 @@ def _mount_routes(app, deps):
         else:
             view_token = (request.form.get("view_token") or request.args.get("view_token") or "").strip()
             inline = (request.args.get("inline") or request.form.get("inline") or "") in ("1", "true", "yes")
-        authed = False
-        if _view_session_ok(view_token, token):
-            authed = True
-        elif not _row_has_password(row):
-            # Passwordless drops still readable without session (public token is the secret)
-            authed = True
-        if not authed:
-            return jsonify({"success": False, "error": "Unlock required or session expired"}), 403
+        closed = row["status"] == "burned"
+        valid_session = _view_session_ok(view_token, token, finishing_pack=closed)
+        if closed and not valid_session:
+            return jsonify({"success": False, "error": "Drop not found"}), 404
+        exp = datetime.fromisoformat(row["expires_at"])
+        if exp <= datetime.now(timezone.utc):
+            _destroy_drop(db, row)
+            return jsonify({"success": False, "error": "Expired"}), 410
+        if not closed and row["download_count"] >= row["max_downloads"]:
+            return jsonify({"success": False, "error": "Access limit reached"}), 410
+        if not valid_session:
+            if _row_has_password(row):
+                return jsonify({"success": False, "error": "Unlock required or session expired"}), 403
+            view_token = ""
 
         try:
             allow_view = bool(row["allow_view"])
@@ -1142,22 +1153,17 @@ def _mount_routes(app, deps):
         # Quota claim after a successful read. Inline view does not consume quota.
         should_burn = False
         if not inline:
-            sess_charged = False
-            if view_token:
-                with _VIEW_SESSIONS_LOCK:
-                    _rec = _VIEW_SESSIONS.get(view_token)
-                    if _rec and _rec.get("drop") == token and _rec.get("dl_charged"):
-                        sess_charged = True
-            if sess_charged and (row["status"] or "").lower() == "burned":
-                # Last authorized session finishing multi-file pack after quota close.
-                should_burn = False
-            else:
-                charged_count, closed = _charge_download_once(db, row, view_token, token)
-                if charged_count is None:
-                    return jsonify({"success": False, "error": "Drop is no longer available"}), 410
-                # Immediate filesystem wipe: burn_after policy or single-file pack only.
-                if closed and (bool(row["burn_after"]) or len(files) <= 1):
-                    should_burn = True
+            try:
+                charged_count, should_burn = _charge_download_once(
+                    db, row, view_token, token, multi_file=len(files) > 1
+                )
+            except _DownloadSessionRequired:
+                return jsonify({
+                    "success": False,
+                    "error": "Reopen this link to start a download session, then try again.",
+                }), 403
+            if charged_count is None:
+                return jsonify({"success": False, "error": "Drop is no longer available"}), 410
 
         if should_burn:
             try:

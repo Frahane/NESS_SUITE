@@ -15,6 +15,7 @@ from werkzeug.test import Client
 
 
 REPORT = b"Synthetic report\n"
+SECOND_REPORT = b"Second synthetic file\n"
 
 
 class BurnSingleDownloadTests(unittest.TestCase):
@@ -130,6 +131,17 @@ class BurnSingleDownloadTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return response.json["view_token"]
 
+    def _add_pack_file(self):
+        other = self.file_path.with_name("second.txt")
+        other.write_bytes(SECOND_REPORT)
+        row = self._row()
+        files = json.loads(row["files_json"])
+        files.append({"filename": "second.txt", "size": len(SECOND_REPORT), "content_type": "text/plain"})
+        with closing(sqlite3.connect(self.db_path)) as db:
+            db.execute("UPDATE burn_drops SET files_json = ? WHERE id = ?", (json.dumps(files), row["id"]))
+            db.commit()
+        return other
+
     def _parallel_downloads(self, sessions):
         files_read = Barrier(len(sessions), timeout=5)
         read_bytes = Path.read_bytes
@@ -178,14 +190,7 @@ class BurnSingleDownloadTests(unittest.TestCase):
 
     def test_two_distinct_files_in_one_session_consume_one_unit(self):
         self._set_quota(3)
-        other = self.file_path.with_name("second.txt")
-        other.write_bytes(b"Second synthetic file\n")
-        row = self._row()
-        files = json.loads(row["files_json"])
-        files.append({"filename": "second.txt", "size": other.stat().st_size, "content_type": "text/plain"})
-        with closing(sqlite3.connect(self.db_path)) as db:
-            db.execute("UPDATE burn_drops SET files_json = ? WHERE id = ?", (json.dumps(files), row["id"]))
-            db.commit()
+        self._add_pack_file()
         session = self._unlock()
         for index in range(2):
             response = self.client.get(
@@ -196,37 +201,85 @@ class BurnSingleDownloadTests(unittest.TestCase):
 
 
     def test_last_unit_session_finishes_multi_file_pack(self):
-        """Session that takes the last quota unit may download every file before wipe."""
-        self._set_quota(1, used=0)
-        other = self.file_path.with_name("second.txt")
-        other.write_bytes(b"Second synthetic file\n")
-        row = self._row()
-        files = json.loads(row["files_json"])
-        files.append({"filename": "second.txt", "size": other.stat().st_size, "content_type": "text/plain"})
-        with closing(sqlite3.connect(self.db_path)) as db:
-            db.execute("UPDATE burn_drops SET files_json = ? WHERE id = ?", (json.dumps(files), row["id"]))
-            db.commit()
-        session = self._unlock()
-        for index in range(2):
-            response = self.client.get(
-                f"/api/burn/{self.token}/file/{index}", query_string={"view_token": session}
-            )
-            self.assertEqual(response.status_code, 200, msg=f"file {index}")
-        self.assertEqual(self._row()["download_count"], 1)
+        """Only the final session can finish, even after periodic cleanup runs."""
+        self._set_quota(2)
+        other = self._add_pack_file()
+        earlier, session, uncharged = self._unlock(), self._unlock(), self._unlock()
+        for view_token in (earlier, session):
+            response = self.client.post(self.file_url, data={"view_token": view_token})
+            self.assertEqual((response.status_code, response.data), (200, REPORT))
+
+        self.assertEqual(self._row()["download_count"], 2)
         self.assertEqual(self._row()["status"], "burned")
-        # Files still on disk until cleanup (multi-file deferred wipe)
+        self.suite.burn_product.cleanup_burn_expired()
         self.assertTrue(self.file_path.exists())
-        self.assertTrue(other.exists())
-        # A *new* session cannot enter
-        other_session = self._unlock()
-        self.assertEqual(
-            self.client.get(
-                f"/api/burn/{self.token}/file/0", query_string={"view_token": other_session}
-            ).status_code,
-            410,
-        )
+        second_url = f"/api/burn/{self.token}/file/1"
+        for view_token in (earlier, uncharged, "unissued-token", ""):
+            response = self.client.post(second_url, data={"view_token": view_token})
+            self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.client.post(f"/api/burn/{self.token}/unlock").status_code, 404)
+        response = self.client.post(second_url, data={"view_token": session})
+        self.assertEqual((response.status_code, response.data), (200, SECOND_REPORT))
+        self.assertEqual(self._row()["download_count"], 2)
+
+        self.suite.burn_product._VIEW_SESSIONS[session]["exp"] = 0
+        self.assertEqual(self.client.post(second_url, data={"view_token": session}).status_code, 404)
         self.suite.burn_product.cleanup_burn_expired()
         self.assertFalse(self.file_path.exists())
+        self.assertFalse(other.exists())
+
+    def test_missing_or_invalid_session_preserves_the_final_pack_unit(self):
+        self._set_quota(1)
+        other = self._add_pack_file()
+        for view_token in ("", "unissued-token"):
+            with self.subTest(view_token=view_token):
+                denied = self.client.get(self.file_url, query_string={"view_token": view_token})
+                self.assertEqual(denied.status_code, 403)
+                self.assertIn("start a download session", denied.json["error"])
+                row = self._row()
+                self.assertEqual((row["download_count"], row["status"]), (0, "active"))
+                self.assertTrue(self.file_path.exists())
+                self.assertTrue(other.exists())
+
+        session = self._unlock()
+        for index, data in enumerate((REPORT, SECOND_REPORT)):
+            response = self.client.post(
+                f"/api/burn/{self.token}/file/{index}", data={"view_token": session}
+            )
+            self.assertEqual((response.status_code, response.data), (200, data))
+        self.assertEqual(self._row()["download_count"], 1)
+
+    def test_tokenless_pack_claim_rechecks_quota_after_a_concurrent_claim(self):
+        self._set_quota(3)
+        self._add_pack_file()
+        initial = self.client.get(self.file_url, environ_overrides={"REMOTE_ADDR": self.ip})
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(self._row()["download_count"], 1)
+
+        session = self._unlock()
+        second_url = f"/api/burn/{self.token}/file/1"
+        read_bytes = Path.read_bytes
+
+        def read_during_charge(path):
+            data = read_bytes(path)
+            if path == self.file_path:
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    claim = pool.submit(
+                        Client(self.suite.app).post, second_url, data={"view_token": session}
+                    ).result(timeout=5)
+                self.assertEqual((claim.status_code, claim.data), (200, SECOND_REPORT))
+            return data
+
+        with patch.object(Path, "read_bytes", read_during_charge):
+            denied = self.client.get(
+                self.file_url, environ_overrides={"REMOTE_ADDR": "198.51.100.1"}
+            )
+        self.assertEqual(denied.status_code, 403)
+        row = self._row()
+        self.assertEqual((row["download_count"], row["status"]), (2, "active"))
+        coalesced = self.client.get(second_url, environ_overrides={"REMOTE_ADDR": self.ip})
+        self.assertEqual((coalesced.status_code, coalesced.data), (200, SECOND_REPORT))
+        self.assertEqual(self._row()["download_count"], 2)
 
     def test_passwordless_client_bursts_keep_the_existing_coalescing_rule(self):
         self._set_quota(3)
