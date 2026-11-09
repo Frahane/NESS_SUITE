@@ -1,8 +1,8 @@
 # NESS Suite
 
-**PrivateNess Network · NESS Coin-Hours (NCH) · TempMail · Burn · Pay · Storage · Wormhole**
+**PrivateNess Network · NESS Coin-Hours (NCH) · TempMail · Burn · Pay · Storage**
 
-Single-process Python application that serves four related products on one payment rail, one SQLite database, and one design system:
+Single-process Python application that serves several related products on one payment rail, one SQLite database, and one design system:
 
 | Product | Role |
 |---------|------|
@@ -11,6 +11,7 @@ Single-process Python application that serves four related products on one payme
 | **NESS Pay** (Invoice) | Payment links: invoice, coffee, fundraising — NCH to *your* address |
 | **NESS Wormhole** | Client-side DPO possession + offline sealed pair (no NCH rail) |
 | **NESS Storage** | **Private** encrypted vault on this device — **not** for sharing (use Burn) |
+| **EmerSSH (SSH Access)** | Manage SSH **public** keys; optional Emercoin NVS publish for EmerSSH hosts |
 
 Paid activations settle **on-chain**.
 
@@ -39,6 +40,7 @@ Paid activations settle **on-chain**.
                 ├── invoice.py      Pay / Invoice routes (register)
                 ├── storage.py      Private Storage routes (register)
                 ├── wormhole.py     Wormhole access licenses (register)
+                ├── ssh.py          EmerSSH / SSH Access (register)
                 └── config.py       dotenv only — no business logic
 
   SMTP thread ──► aiosmtpd ──► messages table (registered mailboxes only)
@@ -50,7 +52,7 @@ Paid activations settle **on-chain**.
 ### Frontend layout
 
 ```text
-templates/     index.html | burn.html | invoice.html | storage.html
+templates/     index.html | burn.html | invoice.html | storage.html | ssh.html | wormhole*.html
 static/css/    app.css (design system) + product overrides
 static/js/     ness-crypto.js → suite-nav.js → confirm-modal.js → product.js
 ```
@@ -274,3 +276,99 @@ requirements.txt
 NESS Suite is built to stay small, auditable, and honest about cryptography and chain settlement.
 
 **Powered by PrivateNess Network**
+
+
+---
+
+## EmerSSH (SSH Access)
+
+**UI path:** `/ssh-access`  
+**Menu label:** EmerSSH (SSH Access)  
+**Module:** `ssh.py` · **UI:** `templates/ssh.html`, `static/js/ssh.js`, `static/css/ssh.css`
+
+### What it is
+
+A suite page to **register SSH public keys**, activate them for authorization, and revoke them.  
+Private keys are generated **in the browser** (Web Crypto) or supplied by the user; they are **never uploaded** to NESS Suite.
+
+When Emercoin JSON-RPC is configured on the **server**, activation publishes the public key into **Emercoin NVS** under a name of the form:
+
+```text
+ssh:ness:<username>:<token>
+```
+
+SSH hosts that run **EmerSSH** (`emcssh` as `AuthorizedKeysCommand`) can authorize logins from those NVS records. Configuring the coin daemon and `emcssh` is an **operator** task (dotenv + server packages), not an end-user chore in the UI.
+
+### User flow (no ops jargon)
+
+1. Open **EmerSSH (SSH Access)**.
+2. **Generate keypair** (Ed25519, ECDSA P-256/P-384, RSA 2048/4096) *or* paste / upload a `.pub` file.
+3. Download and safeguard the **private** key (shown once).
+4. **Register** the public key (status `pending`), then **Activate**.
+5. Optionally set **Server host** (domain or IP) and **Use in command** to copy `ssh user@host`.
+6. **Revoke** when access must end.
+
+Device identity (`X-Device-Id` / NessVault) owns the key rows. Anonymous browsers cannot create keys.
+
+### Operator configuration (`.env`)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `EMERCOIN_RPC_URL` | For on-chain activate | JSON-RPC endpoint, e.g. `http://127.0.0.1:6662` |
+| `EMERCOIN_RPC_USER` | With URL | RPC username |
+| `EMERCOIN_RPC_PASS` | With URL | RPC password |
+| `EMERCOIN_NVS_DAYS` | No (default `365`) | NVS lease days for `name_new` / `name_update` |
+| `SSH_MAX_KEYS_PER_DEVICE` | No (default `20`) | Cap of non-revoked keys per device owner |
+| `SSH_ALLOW_LOCAL_ACTIVATE` | No (default off) | `1` / `true` — lab only: mark keys `active` **without** NVS publish |
+
+RPC credentials are read from the process environment on **each** RPC call (supports updating env without editing code). Prefer reloading the app process after changing secrets.
+
+**Without** `EMERCOIN_RPC_URL`:
+
+- Users can still **save** public keys (`pending`).
+- **Activate** returns a temporary failure (user-facing, no `.env` leakage), unless `SSH_ALLOW_LOCAL_ACTIVATE=1`.
+
+### API (summary)
+
+| Method | Path | Notes |
+|--------|------|--------|
+| `GET` | `/ssh-access` | Page |
+| `GET` | `/api/ssh/status` | `{ rpc_configured, max_keys, … }` |
+| `GET` | `/api/ssh/keys` | List current device keys |
+| `POST` | `/api/ssh/keys` | Body JSON `{ username, public_key }` |
+| `POST` | `/api/ssh/keys/<id>/activate` | NVS publish or gated local |
+| `DELETE` | `/api/ssh/keys/<id>` | Revoke (best-effort `name_delete`) |
+
+Rate limits: per-IP via `_rate_key` + `_rate_global` on list/add/activate/revoke.
+
+### SSH server (operator only)
+
+On hosts that should honor NVS-backed keys:
+
+```text
+AuthorizedKeysCommand /usr/local/bin/emcssh
+AuthorizedKeysCommandUser root
+```
+
+Install and configure **emcssh** according to EmerSSH / Emercoin documentation. Leave classic `authorized_keys` management empty if NVS is the sole source of truth.
+
+### Security properties
+
+- Public keys only in SQLite (`ssh_keys`); fingerprints SHA256 (OpenSSH-style).
+- Username: `^[a-z][a-z0-9_-]{0,31}$`.
+- Public key max length 8 KiB; format `ssh-ed25519` / `ssh-rsa` / `ecdsa-sha2-nistp*`.
+- Ownership: `creator_key` from device id; `anon` cannot mutate.
+- Revoke is idempotent; NVS delete failures still mark local `revoked`.
+- Generated private PEM is wiped from the DOM after register/close.
+
+### Database
+
+Table `ssh_keys` (created on register):  
+`id`, `creator_key`, `username`, `public_key`, `fingerprint`, `key_type`, `status` (`pending`|`active`|`revoked`), `nvs_name`, `created_at`, `activated_at`, `revoked_at`.
+
+### Typography (suite)
+
+- **Inter** — UI chrome and body (clean, modern, high legibility on mobile).
+- **JetBrains Mono** — fingerprints, keys, commands, SSH snippets.
+- **Newsreader** — reserved for long-form reading surfaces (e.g. Burn notes), not the EmerSSH control panel.
+

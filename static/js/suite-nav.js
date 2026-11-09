@@ -22,6 +22,7 @@
         '<a class="suite-link" data-suite="invoice" href="/invoice">NESS Pay</a>' +
         '<a class="suite-link" data-suite="storage" href="/storage">NESS Storage</a>' +
         '<a class="suite-link" data-suite="wormhole" href="/wormhole">NESS Wormhole</a>' +
+        '<a class="suite-link" data-suite="ssh" href="/ssh-access">EmerSSH (SSH Access)</a>' +
         '<div class="suite-sep" role="separator" aria-hidden="true"></div>' +
         '<div class="suite-section-label">Companion</div>' +
         '<button type="button" class="suite-link suite-link-ext suite-link-btn" data-suite="poisoner" id="suite-poisoner-btn" ' +
@@ -44,6 +45,7 @@
     else if (path.indexOf("/invoice") === 0) active = "invoice";
     else if (path.indexOf("/storage") === 0) active = "storage";
     else if (path.indexOf("/wormhole") === 0) active = "wormhole";
+    else if (path.indexOf("/ssh") === 0) active = "ssh";
     root.querySelectorAll(".suite-link[data-suite]").forEach(function (a) {
       const id = a.getAttribute("data-suite");
       if (id === active) {

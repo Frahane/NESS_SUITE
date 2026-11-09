@@ -392,3 +392,14 @@ WORMHOLE_TOOLS = {
         "tagline": "AES-256-GCM · two carriers · fully offline",
     },
 }
+
+
+# ── EmerSSH / Emercoin NVS (optional — SSH Access product) ───────────────
+# When unset, activation stays local-pending and UI shows "RPC not configured".
+EMERCOIN_RPC_URL = (_env("EMERCOIN_RPC_URL", "") or "").strip()
+EMERCOIN_RPC_USER = (_env("EMERCOIN_RPC_USER", "") or "").strip()
+EMERCOIN_RPC_PASS = (_env("EMERCOIN_RPC_PASS", "") or "").strip()
+EMERCOIN_NVS_DAYS = _env_int("EMERCOIN_NVS_DAYS", 365)
+SSH_MAX_KEYS_PER_DEVICE = _env_int("SSH_MAX_KEYS_PER_DEVICE", 20)
+
+SSH_ALLOW_LOCAL_ACTIVATE = (_env("SSH_ALLOW_LOCAL_ACTIVATE", "0") or "0").strip() in ("1", "true", "yes")

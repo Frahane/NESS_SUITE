@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5">
+<title>EmerSSH (SSH Access)</title>
+<meta name="description" content="{{ og_description | default('EmerSSH — sovereign SSH access') }}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="NESS Suite">
+<meta property="og:title" content="{{ og_title | default('EmerSSH (SSH Access)') }}">
+<meta property="og:description" content="{{ og_description | default('EmerSSH — sovereign SSH access') }}">
+<meta property="og:image" content="{{ og_image | default('/static/og/og-suite.png') }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:url" content="{{ og_url | default('') }}">
+<meta name="twitter:card" content="summary_large_image">
+<script>
+(function () {
+  try {
+    if (localStorage.getItem("ness_theme") === "light") {
+      document.documentElement.setAttribute("data-theme", "light");
+    }
+  } catch (e) {}
+})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/app.css">
+<link rel="stylesheet" href="/static/css/ssh.css">
+</head>
+<body>
+<div id="toasts"></div>
+
+<div class="wrap">
+  <header class="hero">
+    <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle light / dark mode" title="Toggle theme">
+      <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M21 14.3A8.5 8.5 0 0 1 9.7 3a7 7 0 1 0 11.3 11.3z"/>
+      </svg>
+      <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="4"/>
+        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+      </svg>
+    </button>
+    <h1>EmerSSH (SSH Access)</h1>
+    <p class="tagline">Sovereign SSH keys · PrivateNess Network</p>
+    <div class="status-wrap">
+      <span class="status-pill" id="rpc-pill">
+        <span class="status-dot" id="rpc-dot"></span>
+        <span id="rpc-label">Checking…</span>
+      </span>
+    </div>
+  </header>
+
+  <div class="card" id="connect-card">
+    <div class="section-label">Connect</div>
+    <label class="field">
+      <span>Server host</span>
+      <input type="text" id="ssh-host" class="ssh-input" placeholder="203.0.113.10 or server.example.com" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>SSH command</span>
+      <input type="text" id="ssh-cmd" class="ssh-input" readonly placeholder="ssh user@203.0.113.10">
+    </label>
+    <div class="actions ssh-cmd-actions">
+      <button type="button" class="btn btn-sm" id="btn-copy-cmd">Copy command</button>
+    </div>
+    <p class="fineprint">Host can be a domain or IP. Stored in this browser only — pick a key below to fill the user.</p>
+  </div>
+
+  <div class="card">
+    <div class="section-label">Your SSH keys</div>
+    <p class="fineprint" style="margin-top:0;">Public keys only. Private keys never leave your device.</p>
+    <div id="keys-empty" class="empty" style="display:none;">
+      <div class="empty-icon">🔑</div>
+      <p>No keys yet. Generate a pair or paste a public key.</p>
+    </div>
+    <div id="keys-list" class="ssh-key-list"></div>
+    <div class="actions" style="margin-top:1rem;">
+      <button type="button" class="btn" id="btn-add-key">Add public key</button>
+      <label class="field ssh-algo-field"><span>Key type</span><select id="gen-algo" class="ssh-input"><option value="ed25519" selected>Ed25519 (recommended)</option><option value="ecdsa256">ECDSA P-256</option><option value="ecdsa384">ECDSA P-384</option><option value="rsa2048">RSA 2048</option><option value="rsa4096">RSA 4096</option></select></label>
+      <button type="button" class="btn btn-ghost" id="btn-generate">Generate keypair</button>
+      <button type="button" class="btn btn-ghost" id="btn-invite">Invite link</button>
+    </div>
+  </div>
+
+  <div class="card" id="gen-card" style="display:none;">
+    <div class="section-label">Generated keypair</div>
+    <p class="fineprint warn-line">Save the private key now. It is shown once and never uploaded. PKCS#8 PEM works with modern OpenSSH.</p>
+    <label class="field">
+      <span>Private key (download &amp; protect)</span>
+      <textarea id="gen-private" class="ssh-pubkey" rows="6" readonly spellcheck="false"></textarea>
+    </label>
+    <div class="actions">
+      <button type="button" class="btn btn-sm" id="btn-dl-private">Download private key</button>
+      <button type="button" class="btn btn-sm btn-ghost" id="btn-copy-private">Copy private key</button>
+    </div>
+    <label class="field" style="margin-top:0.85rem;">
+      <span>Public key (will be registered)</span>
+      <textarea id="gen-public" class="ssh-pubkey" rows="3" readonly spellcheck="false"></textarea>
+    </label>
+    <label class="field">
+      <span>SSH username for this key</span>
+      <input type="text" id="gen-username" placeholder="alice" maxlength="32" spellcheck="false">
+    </label>
+    <div class="actions" style="margin-top:1rem;">
+      <button type="button" class="btn" id="btn-register-gen">Register public key</button>
+      <button type="button" class="btn btn-ghost" id="btn-cancel-gen">Close</button>
+    </div>
+  </div>
+
+  <div class="card" id="add-card" style="display:none;">
+    <div class="section-label">Add key</div>
+    <label class="field">
+      <span>SSH username</span>
+      <input type="text" id="ssh-username" placeholder="alice" autocomplete="username" maxlength="32" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>Public key</span>
+      <textarea id="ssh-pubkey" class="ssh-pubkey" rows="4" placeholder="ssh-ed25519 AAAA… comment" spellcheck="false"></textarea>
+    </label>
+    <label class="field">
+      <span>Or upload <span class="mono">.pub</span> file</span>
+      <input type="file" id="ssh-pubfile" accept=".pub,text/plain">
+    </label>
+    <p class="fineprint">Single-line <span class="mono">ssh-ed25519</span> or <span class="mono">ssh-rsa</span> public key.</p>
+    <div class="actions" style="margin-top:1rem;">
+      <button type="button" class="btn" id="btn-save-key">Save key</button>
+      <button type="button" class="btn btn-ghost" id="btn-cancel-add">Cancel</button>
+    </div>
+  </div>
+
+  <div class="card" id="invite-card" style="display:none;">
+    <div class="section-label">Invitation</div>
+    <p class="fineprint">Share this link to open the add-key form on this suite. It is not a secret invite token — each person still uses their own device identity.</p>
+    <div class="copy-row">
+      <input type="text" id="invite-url" readonly>
+      <button type="button" class="btn btn-sm" id="btn-copy-invite">Copy</button>
+    </div>
+    <div class="actions" style="margin-top:0.85rem;">
+      <button type="button" class="btn btn-ghost" id="btn-close-invite">Close</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-label">For your server</div>
+    <p class="fineprint">Optional snippet if you operate the SSH host yourself. Most users only need keys + Activate.</p>
+    <pre class="ssh-pre" id="sshd-snippet">AuthorizedKeysCommand /usr/local/bin/emcssh
+AuthorizedKeysCommandUser root</pre>
+    <div class="actions ssh-sshd-actions">
+      <button type="button" class="btn btn-sm" id="btn-copy-sshd">Copy</button>
+    </div>
+    <p class="fineprint" id="rpc-help" style="margin-top:0.85rem;"></p>
+  </div>
+
+  <div class="card">
+    <div class="section-label">How it works</div>
+    <ol class="ssh-steps">
+      <li>Generate or paste a <strong>public</strong> key (your private key stays on this device only).</li>
+      <li><strong>Activate</strong> publishes the public key so SSH servers can authorize you.</li>
+      <li>OpenSSH validates your key on each connection.</li>
+      <li><strong>Revoke</strong> withdraws authorization — the next login with that key fails.</li>
+    </ol>
+  </div>
+
+  <p class="foot">PrivateNess Network · EmerSSH bridge</p>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous"></script>
+<script src="/static/js/ness-crypto.js"></script>
+<script src="/static/js/confirm-modal.js"></script>
+<script src="/static/js/suite-nav.js"></script>
+<script src="/static/js/ssh.js"></script>
+</body>
+</html>

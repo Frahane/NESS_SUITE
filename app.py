@@ -95,6 +95,7 @@ import burn as burn_product
 import invoice as invoice_product
 import storage as storage_product
 import wormhole as wormhole_product
+import ssh as ssh_product
 
 
 # ==========================================================================
@@ -861,6 +862,11 @@ _OG_CATALOG = {
         "title": "NESS Wormhole",
         "description": "Physical possession and offline sealed pairs — client-side tools.",
         "image": "og-wormhole.png",
+    },
+    "ssh": {
+        "title": "EmerSSH (SSH Access)",
+        "description": "EmerSSH — manage SSH public keys on Emercoin NVS.",
+        "image": "og-suite.png",
     },
 }
 
@@ -2242,6 +2248,20 @@ wormhole_product.register(app, {
     "_is_plausible_txid": _is_plausible_txid,
     "_explorer_unavailable_payload": _explorer_unavailable_payload,
 })
+
+ssh_product.register(app, {
+    "get_db": get_db,
+    "jsonify": jsonify,
+    "request": request,
+    "HAS_FLASK": HAS_FLASK,
+    "render_template": render_template if HAS_FLASK else None,
+    "_rate_ok": _rate_ok,
+    "_rate_key": _rate_key,
+    "_rate_global": _rate_global,
+    "_client_device_id": _client_device_id,
+    "_owner_key": _owner_key,
+})
+
 
 
 

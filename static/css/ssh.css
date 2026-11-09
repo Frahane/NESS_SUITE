@@ -1,0 +1,179 @@
+/* NESS SSH Access — product overrides only */
+.ssh-key-list { margin-top: 0.75rem; }
+.ssh-key-row {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.85rem 0.95rem;
+  margin-bottom: 0.55rem;
+  background: var(--surface);
+}
+.ssh-key-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem 0.75rem;
+  margin-bottom: 0.35rem;
+}
+.ssh-fp {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.82rem;
+  color: var(--text-hi);
+  word-break: break-all;
+}
+.ssh-meta {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.ssh-key-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.55rem;
+}
+.ssh-pubkey {
+  width: 100%;
+  min-height: 6rem;
+  resize: vertical;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.8rem;
+  background: var(--bg-elevated);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0.65rem 0.75rem;
+}
+.ssh-pubkey:focus {
+  outline: none;
+  border-color: var(--line-hi);
+}
+.ssh-pre {
+  margin: 0.5rem 0 0.65rem;
+  padding: 0.85rem 0.95rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--bg-elevated);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.8rem;
+  color: var(--text-hi);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.ssh-steps {
+  margin: 0.35rem 0 0 1.15rem;
+  padding: 0;
+  color: var(--text);
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+.ssh-steps li { margin-bottom: 0.4rem; }
+.badge-pending { color: var(--warn); }
+.badge-active { color: var(--accent); }
+.badge-revoked { color: var(--muted); }
+
+.warn-line { color: var(--warn); }
+#ssh-pubfile {
+  width: 100%;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.ssh-key-row.is-selected { border-color: var(--line-hi); box-shadow: 0 0 0 1px rgba(0,255,65,0.12); }
+
+
+/* Form controls — match suite fields (never bare browser defaults) */
+.ssh-input,
+#ssh-host,
+#ssh-cmd,
+#ssh-username,
+#gen-username,
+#invite-url,
+select#gen-algo,
+input[type="text"].ssh-input,
+.field input[type="text"],
+.field input[type="file"],
+.field select {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 0.92rem;
+  color: var(--text-hi);
+  background: var(--bg-elevated);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0.65rem 0.75rem;
+  transition: border-color var(--t), background var(--t);
+}
+.field input[type="text"]:focus,
+.field select:focus,
+#ssh-host:focus,
+#ssh-cmd:focus,
+#ssh-username:focus,
+#gen-username:focus,
+#gen-algo:focus {
+  outline: none;
+  border-color: var(--line-hi);
+}
+#ssh-cmd,
+#invite-url {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.82rem;
+  color: var(--text);
+}
+.field input[type="file"] {
+  padding: 0.5rem 0.65rem;
+  color: var(--muted);
+}
+.ssh-algo-field {
+  flex: 1 1 12rem;
+  margin: 0;
+  min-width: 10rem;
+}
+.card .actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.55rem;
+}
+
+/* Copy under SSH command — clear separation from inputs */
+#connect-card .field { margin-bottom: 0.75rem; }
+.ssh-cmd-actions {
+  margin-top: 0.35rem;
+  margin-bottom: 0.65rem;
+}
+.ssh-sshd-actions {
+  margin-top: 0.55rem;
+}
+
+/* ssh-hero-polish — typography & hierarchy within suite tokens */
+.wrap > .hero h1 {
+  font-family: Inter, system-ui, sans-serif;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+.wrap > .hero .tagline {
+  font-family: Inter, system-ui, sans-serif;
+  color: var(--muted);
+  max-width: 28rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+#gen-card {
+  border-color: var(--line-hi);
+  box-shadow: var(--shadow-soft);
+}
+#gen-card .section-label {
+  color: var(--accent);
+}
+.ssh-key-row {
+  transition: border-color var(--t), box-shadow var(--t);
+}
+.ssh-key-row:hover {
+  border-color: var(--line-hi);
+}
+#connect-card .section-label,
+.card .section-label {
+  letter-spacing: 0.04em;
+}
