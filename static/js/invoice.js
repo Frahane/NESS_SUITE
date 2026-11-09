@@ -966,7 +966,12 @@ function setPayBtnBusy($btn, busy, idleLabel) {
       .then(function (pack) {
         var data = pack.data;
         if (!data || !data.success) {
-          toast((data && data.error) || "Verification failed", "err");
+          var err = (data && data.error) || "Verification failed";
+          var low = String(err).toLowerCase();
+          if (low.indexOf("already used") >= 0 || low.indexOf("anti-replay") >= 0) {
+            err = "This transaction already confirmed another payment. Use a separate payment for this link.";
+          }
+          toast(err, "err");
           return;
         }
         toast(data.already_paid ? "Already paid" : "Payment confirmed", "ok");

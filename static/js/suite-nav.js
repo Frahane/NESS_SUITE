@@ -1,11 +1,9 @@
 /* Shared suite navigation — products + companion tools (identical on every page) */
 (function () {
-  var POISONER_REPO = "https://github.com/ness-network/privateness-data-poisoner";
+  var POISONER_REPO = "https://github.com/Jeff-Bouchard/privateness-data-poisoner";
+  /* Archive of default branch (master) — verified downloadable */
   var POISONER_ZIP =
-    "https://github.com/ness-network/privateness-data-poisoner/archive/refs/heads/main.zip";
-  /* Jeff fork mirror if ness-network 404s — primary stays ness-network */
-  var POISONER_ZIP_FALLBACK =
-    "https://github.com/Jeff-Bouchard/privateness-data-poisoner/archive/refs/heads/main.zip";
+    "https://github.com/Jeff-Bouchard/privateness-data-poisoner/archive/refs/heads/master.zip";
 
   function ensureNav() {
     if (document.getElementById("suite-root")) return;
@@ -129,8 +127,8 @@
     overlay.innerHTML =
       '<div class="modal poisoner-guide-modal">' +
         '<h3 id="poisoner-guide-title">Data Poisoner</h3>' +
-        '<p class="poisoner-lead">Free browser extension (beta). It reduces tracking and can feed trackers synthetic data — on your device, not through NESS Suite.</p>' +
-        '<p class="poisoner-honest">Browsers do not allow websites to install extensions with one click. Until it is on the Chrome Web Store, install once with these steps:</p>' +
+        '<p class="poisoner-lead">Free browser extension (beta). It reduces tracking and can feed trackers synthetic data — on your device.</p>' +
+        '<p class="poisoner-honest">Browsers do not allow websites to install extensions with one click. Install once with these steps:</p>' +
         '<ol class="poisoner-steps">' +
           '<li><strong>Download</strong> the extension folder (ZIP).</li>' +
           '<li><strong>Unpack</strong> the ZIP on your computer.</li>' +
