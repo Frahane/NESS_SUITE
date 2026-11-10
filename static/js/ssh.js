@@ -72,12 +72,84 @@
     var body = concatBytes([sshString(type), sshString(rawPub32)]);
     return "ssh-ed25519 " + b64(body) + (comment ? " " + comment : "");
   }
+
   function toPemPkcs8(pkcs8) {
     var u8 = new Uint8Array(pkcs8);
     var b = b64(u8);
     var lines = b.match(/.{1,64}/g) || [];
     return "-----BEGIN PRIVATE KEY-----\n" + lines.join("\n") + "\n-----END PRIVATE KEY-----\n";
   }
+
+  /** Extract 32-byte Ed25519 seed from PKCS#8 (RFC 8410). */
+  function ed25519SeedFromPkcs8(pkcs8) {
+    var u8 = new Uint8Array(pkcs8);
+    // Prefer: OID 1.3.101.112 (2b 65 70) then OCTET STRING wrapping 32-byte seed
+    for (var i = 0; i < u8.length - 5; i++) {
+      if (u8[i] === 0x06 && u8[i + 1] === 0x03 && u8[i + 2] === 0x2b &&
+          u8[i + 3] === 0x65 && u8[i + 4] === 0x70) {
+        for (var j = i + 5; j < u8.length - 2; j++) {
+          if (u8[j] === 0x04 && u8[j + 1] === 0x20 && j + 34 <= u8.length) {
+            return u8.slice(j + 2, j + 34);
+          }
+          if (u8[j] === 0x04 && u8[j + 1] === 0x22 && u8[j + 2] === 0x04 &&
+              u8[j + 3] === 0x20 && j + 36 <= u8.length) {
+            return u8.slice(j + 4, j + 36);
+          }
+        }
+      }
+    }
+    // Fallback: last 32-byte OCTET STRING
+    for (var k = u8.length - 34; k >= 0; k--) {
+      if (u8[k] === 0x04 && u8[k + 1] === 0x20) return u8.slice(k + 2, k + 34);
+    }
+    return null;
+  }
+
+  function sshUint32(n) {
+    return new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+  }
+
+  /**
+   * OpenSSH private key (openssh-key-v1, unencrypted) for Ed25519.
+   * Compatible with `ssh -i id_ed25519` without conversion.
+   */
+  function toOpenSshPrivateEd25519(seed32, pub32, comment) {
+    comment = comment || "";
+    var keyType = new TextEncoder().encode("ssh-ed25519");
+    var pubBlob = concatBytes([sshString(keyType), sshString(pub32)]);
+    // OpenSSH stores private as seed||public (64 bytes)
+    var privCombined = concatBytes([seed32, pub32]);
+    var check = (Math.random() * 0xffffffff) >>> 0;
+    var privateSection = concatBytes([
+      sshUint32(check),
+      sshUint32(check),
+      sshString(keyType),
+      sshString(pub32),
+      sshString(privCombined),
+      sshString(new TextEncoder().encode(comment)),
+    ]);
+    // pad to 8-byte block with 1,2,3...
+    var padLen = (8 - (privateSection.length % 8)) % 8;
+    if (padLen) {
+      var pad = new Uint8Array(padLen);
+      for (var i = 0; i < padLen; i++) pad[i] = i + 1;
+      privateSection = concatBytes([privateSection, pad]);
+    }
+    var none = new TextEncoder().encode("none");
+    var empty = new Uint8Array(0);
+    var body = concatBytes([
+      new TextEncoder().encode("openssh-key-v1\0"),
+      sshString(none), // cipher
+      sshString(none), // kdf
+      sshString(empty), // kdf options
+      sshUint32(1), // nkeys
+      sshString(pubBlob),
+      sshString(privateSection),
+    ]);
+    var lines = b64(body).match(/.{1,70}/g) || [];
+    return "-----BEGIN OPENSSH PRIVATE KEY-----\n" + lines.join("\n") + "\n-----END OPENSSH PRIVATE KEY-----\n";
+  }
+
 
 
 
@@ -142,6 +214,11 @@
   var keys = [];
   var rpcOk = false;
   var selectedUser = "";
+  var sshTiers = [];
+  var entitlement = null;
+  var payAddress = "";
+  var selectedPlan = "free";
+  var pendingSshIntent = null;
 
   function setRpcPill(ok, label) {
     rpcOk = !!ok;
@@ -160,13 +237,43 @@
     }
   }
 
+  function parseHostPort(raw) {
+    raw = String(raw || "").trim();
+    var host = raw;
+    var port = "";
+    // IPv6 in brackets: [2001:db8::1]:22
+    var m6 = raw.match(/^\[([^\]]+)\](?::(\d{1,5}))?$/);
+    if (m6) {
+      return { host: m6[1], port: m6[2] || "" };
+    }
+    // host:port or IPv4:port (single colon)
+    if (raw.indexOf(":") >= 0 && raw.indexOf("::") < 0) {
+      var parts = raw.split(":");
+      if (parts.length === 2 && /^\d{1,5}$/.test(parts[1])) {
+        return { host: parts[0], port: parts[1] };
+      }
+    }
+    return { host: host, port: port };
+  }
+
   function updateCmd() {
-    var host = ($("ssh-host") && $("ssh-host").value || "").trim();
+    var raw = ($("ssh-host") && $("ssh-host").value || "").trim();
     var user = selectedUser || "";
+    var hp = parseHostPort(raw);
+    var host = hp.host;
+    var port = hp.port;
     var cmd = "";
-    if (user && host) cmd = "ssh " + user + "@" + host;
-    else if (user) cmd = "ssh " + user + "@<host>";
-    else if (host) cmd = "ssh <user>@" + host;
+    if (user && host) {
+      cmd = port
+        ? ("ssh -p " + port + " " + user + "@" + host)
+        : ("ssh " + user + "@" + host);
+    } else if (user) {
+      cmd = "ssh " + user + "@<host>";
+    } else if (host) {
+      cmd = port
+        ? ("ssh -p " + port + " <user>@" + host)
+        : ("ssh <user>@" + host);
+    }
     if ($("ssh-cmd")) $("ssh-cmd").value = cmd;
   }
 
@@ -185,6 +292,8 @@
     list.innerHTML = "";
     if (!keys.length) {
       if (empty) empty.style.display = "";
+      var sc0 = $("keys-scroll");
+      if (sc0) sc0.classList.remove("is-scrollable");
       return;
     }
     if (empty) empty.style.display = "none";
@@ -228,6 +337,21 @@
         revokeKey(btn.closest("[data-id]").getAttribute("data-id"));
       });
     });
+    var sc = $("keys-scroll");
+    if (sc) {
+      if (keys.length >= 2) {
+        sc.classList.add("is-scrollable");
+        /* Inline fallback: some mobile WebViews ignore max-height without explicit style */
+        sc.style.maxHeight = "13.5rem";
+        sc.style.overflowY = "scroll";
+        sc.style.webkitOverflowScrolling = "touch";
+      } else {
+        sc.classList.remove("is-scrollable");
+        sc.style.maxHeight = "";
+        sc.style.overflowY = "";
+        sc.style.webkitOverflowScrolling = "";
+      }
+    }
   }
 
   function loadKeys() {
@@ -252,8 +376,142 @@
         if (!data || !data.success) return;
         setRpcPill(!!data.rpc_configured,
           data.rpc_configured ? "Ready" : "Save only");
+        payAddress = data.pay_address || "";
+        sshTiers = data.tiers || [];
+        entitlement = data.entitlement || null;
+        renderPlans();
+        renderEntitlement();
       })
       .catch(function () { setRpcPill(false, "Status unavailable"); });
+  }
+
+  function renderEntitlement() {
+    var el = $("entitlement-line");
+    if (!el || !entitlement) return;
+    var line = "Current: " + (entitlement.label || entitlement.plan) +
+      " · " + entitlement.max_keys + " key" + (entitlement.max_keys === 1 ? "" : "s");
+    if (entitlement.paid && entitlement.expires_at) {
+      line += " · until " + String(entitlement.expires_at).replace("T", " ").slice(0, 16) + " UTC";
+    }
+    el.textContent = line;
+  }
+
+  function renderPlans() {
+    var grid = $("ssh-plans");
+    if (!grid || !sshTiers.length) return;
+    grid.innerHTML = "";
+    sshTiers.forEach(function (tier) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "purpose-card" + (tier.id === selectedPlan ? " selected" : "");
+      btn.setAttribute("data-plan", tier.id);
+      btn.setAttribute("role", "option");
+      btn.setAttribute("aria-selected", tier.id === selectedPlan ? "true" : "false");
+      var price = int(tier.price_nch) <= 0 ? "Free" : (tier.price_nch + " NCH");
+      btn.innerHTML =
+        '<span class="purpose-label">' + esc(tier.label) + "</span>" +
+        '<span class="purpose-hint">' + esc(tier.hint || price) + "</span>" +
+        '<span class="purpose-hint mono">' + esc(price) + "</span>";
+      btn.addEventListener("click", function () { selectPlan(tier.id); });
+      grid.appendChild(btn);
+    });
+  }
+
+  function int(n) { return parseInt(n, 10) || 0; }
+
+  function selectPlan(planId) {
+    selectedPlan = planId;
+    renderPlans();
+    var tier = null;
+    for (var i = 0; i < sshTiers.length; i++) {
+      if (sshTiers[i].id === planId) { tier = sshTiers[i]; break; }
+    }
+    var pay = $("ssh-pay");
+    if (!tier || int(tier.price_nch) <= 0) {
+      if (pay) pay.style.display = "none";
+      pendingSshIntent = null;
+      return;
+    }
+    if (pay) pay.style.display = "";
+    if ($("ssh-pay-addr")) $("ssh-pay-addr").value = payAddress || "";
+    if ($("ssh-pay-amount")) {
+      $("ssh-pay-amount").textContent = tier.price_nch + " NCH · " + (tier.hint || "");
+    }
+    // Create intent
+    fetch("/api/ssh/intent", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, deviceHeaders()),
+      credentials: "same-origin",
+      body: JSON.stringify({ plan: planId }),
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (pack) {
+        if (!pack.d || !pack.d.success) {
+          toast((pack.d && pack.d.error) || "Could not start payment", "err");
+          return;
+        }
+        pendingSshIntent = {
+          intent_id: pack.d.intent_id,
+          plan: planId,
+          amount_nch: pack.d.amount_nch,
+        };
+        try {
+          sessionStorage.setItem("ness_pay_intent_ssh", JSON.stringify(pendingSshIntent));
+        } catch (e) {}
+        if ($("ssh-pay-addr") && pack.d.pay_address) {
+          $("ssh-pay-addr").value = pack.d.pay_address;
+        }
+        toast("Send " + pack.d.amount_nch + " NCH, then paste the tx hash", "ok");
+      })
+      .catch(function () { toast("Could not start payment", "err"); });
+  }
+
+  function verifySshPay() {
+    var tx = ($("ssh-pay-tx") && $("ssh-pay-tx").value || "").trim();
+    if (!pendingSshIntent) {
+      try {
+        pendingSshIntent = JSON.parse(sessionStorage.getItem("ness_pay_intent_ssh") || "null");
+      } catch (e) { pendingSshIntent = null; }
+    }
+    if (!pendingSshIntent || !pendingSshIntent.intent_id) {
+      toast("Select a paid plan first", "warn");
+      return;
+    }
+    if (tx.length < 16) { toast("Paste a valid transaction hash", "warn"); return; }
+    var btn = $("btn-ssh-verify");
+    if (btn) { btn.disabled = true; btn.textContent = "Verifying…"; }
+    fetch("/api/ssh/verify", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, deviceHeaders()),
+      credentials: "same-origin",
+      body: JSON.stringify({
+        tx_hash: tx,
+        intent_id: pendingSshIntent.intent_id,
+        plan: pendingSshIntent.plan || selectedPlan,
+      }),
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (pack) {
+        if (!pack.d || !pack.d.success) {
+          var err = (pack.d && pack.d.error) || "Verification failed";
+          if (String(err).toLowerCase().indexOf("already used") >= 0) {
+            err = "This transaction already confirmed another payment.";
+          }
+          toast(err, "err");
+          return;
+        }
+        toast("Plan active — you can register more public keys", "ok");
+        pendingSshIntent = null;
+        try { sessionStorage.removeItem("ness_pay_intent_ssh"); } catch (e) {}
+        if ($("ssh-pay")) $("ssh-pay").style.display = "none";
+        selectedPlan = "free";
+        loadStatus();
+        loadKeys();
+      })
+      .catch(function () { toast("Verification failed", "err"); })
+      .then(function () {
+        if (btn) { btn.disabled = false; btn.textContent = "Verify payment"; }
+      });
   }
 
   function postKey(username, public_key) {
@@ -277,7 +535,15 @@
     postKey(username, public_key)
       .then(function (pack) {
         if (!pack.d || !pack.d.success) {
-          toast((pack.d && pack.d.error) || "Save failed", "err");
+          var err = (pack.d && pack.d.error) || "Save failed";
+          if (pack.d && pack.d.need_upgrade) {
+            toast(err, "warn");
+            requestAnimationFrame(function () {
+              smartScrollTo($("plans-card") || $("ssh-plans"), { force: true });
+            });
+          } else {
+            toast(err, "err");
+          }
           return;
         }
         toast("Key saved (pending)", "ok");
@@ -287,6 +553,13 @@
         try { localStorage.setItem(SELECT_USER_KEY, selectedUser); } catch (e) {}
         updateCmd();
         loadKeys();
+        requestAnimationFrame(function () {
+          var sc = $("keys-scroll");
+          if (sc) {
+            sc.scrollTop = 0;
+            smartScrollTo(sc, { force: true });
+          }
+        });
       })
       .catch(function () { toast("Save failed", "err"); })
       .then(function () {
@@ -400,7 +673,12 @@
         var rawPub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
         var pkcs8 = await crypto.subtle.exportKey("pkcs8", kp.privateKey);
         pubLine = toOpenSshPublic(rawPub, comment);
-        pem = toPemPkcs8(pkcs8);
+        var seed = ed25519SeedFromPkcs8(pkcs8);
+        if (seed && seed.length === 32) {
+          pem = toOpenSshPrivateEd25519(seed, rawPub, comment);
+        } else {
+          pem = toPemPkcs8(pkcs8);
+        }
       } else if (algo === "ecdsa256" || algo === "ecdsa384") {
         var named = algo === "ecdsa256" ? "P-256" : "P-384";
         var curve = algo === "ecdsa256" ? "nistp256" : "nistp384";
@@ -468,7 +746,9 @@
     var blob = new Blob([pem], { type: "application/x-pem-file" });
     var a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = "ness-ssh-ed25519.pem";
+    if (pem.indexOf("OPENSSH PRIVATE KEY") >= 0) a.download = "id_ed25519";
+    else if (pem.indexOf("BEGIN PRIVATE KEY") >= 0) a.download = "ness-ssh-private.pem";
+    else a.download = "ness-ssh-key.txt";
     document.body.appendChild(a);
     a.click();
     setTimeout(function () {
@@ -487,10 +767,18 @@
     postKey(username, public_key)
       .then(function (pack) {
         if (!pack.d || !pack.d.success) {
-          toast((pack.d && pack.d.error) || "Save failed", "err");
+          var err2 = (pack.d && pack.d.error) || "Save failed";
+          if (pack.d && pack.d.need_upgrade) {
+            toast(err2, "warn");
+            requestAnimationFrame(function () {
+              smartScrollTo($("plans-card") || $("ssh-plans"), { force: true });
+            });
+          } else {
+            toast(err2, "err");
+          }
           return;
         }
-        toast("Public key registered (pending) — activate when ready", "ok");
+        toast("Public key added (pending) — activate when ready", "ok");
         selectedUser = username;
         try { localStorage.setItem(SELECT_USER_KEY, selectedUser); } catch (e) {}
         updateCmd();
@@ -503,7 +791,7 @@
       })
       .catch(function () { toast("Save failed", "err"); })
       .then(function () {
-        if (btn) { btn.disabled = false; btn.textContent = "Register public key"; }
+        if (btn) { btn.disabled = false; btn.textContent = "Add public key"; }
       });
   }
 
@@ -616,6 +904,18 @@
     if ($("btn-close-invite")) {
       $("btn-close-invite").addEventListener("click", function () {
         $("invite-card").style.display = "none";
+      });
+    }
+
+    if ($("btn-copy-pay-addr")) {
+      $("btn-copy-pay-addr").addEventListener("click", function () {
+        var addr = ($("ssh-pay-addr") && $("ssh-pay-addr").value) || payAddress || "";
+        copyText(addr, "Payment address copied", "No payment address yet — select a paid plan first");
+      });
+    }
+    if ($("btn-ssh-verify")) {
+      $("btn-ssh-verify").addEventListener("click", function () {
+        verifySshPay();
       });
     }
 

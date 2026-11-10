@@ -299,6 +299,13 @@ ssh:ness:<username>:<token>
 
 SSH hosts that run **EmerSSH** (`emcssh` as `AuthorizedKeysCommand`) can authorize logins from those NVS records. Configuring the coin daemon and `emcssh` is an **operator** task (dotenv + server packages), not an end-user chore in the UI.
 
+### Commercial model
+
+- **Spark (free):** capped keys (`SSH_MAX_KEYS_FREE`, default 1) — no NCH.
+- **Flash / Day / Week / Month:** NCH to suite treasury via **payment intent** + on-chain verify + `_claim_tx` (product `ssh`), same anti-replay rail as mail/burn/storage/wormhole.
+- Paid license raises `max_keys` until `expires_at`; renew stacks remaining time.
+- Exceeding the free cap without a license returns **402** with `need_upgrade`.
+
 ### User flow (no ops jargon)
 
 1. Open **EmerSSH (SSH Access)**.
@@ -320,6 +327,7 @@ Device identity (`X-Device-Id` / NessVault) owns the key rows. Anonymous browser
 | `EMERCOIN_NVS_DAYS` | No (default `365`) | NVS lease days for `name_new` / `name_update` |
 | `SSH_MAX_KEYS_PER_DEVICE` | No (default `20`) | Cap of non-revoked keys per device owner |
 | `SSH_ALLOW_LOCAL_ACTIVATE` | No (default off) | `1` / `true` — lab only: mark keys `active` **without** NVS publish |
+| `SSH_MAX_KEYS_FREE` / `SSH_PRICE_*_NCH` / `SSH_MAX_KEYS_*` / `SSH_TTL_*_MIN` | No | Commercial tiers (Spark free → Flash/Day/Week/Month) |
 
 RPC credentials are read from the process environment on **each** RPC call (supports updating env without editing code). Prefer reloading the app process after changing secrets.
 
@@ -359,7 +367,11 @@ Install and configure **emcssh** according to EmerSSH / Emercoin documentation. 
 - Public key max length 8 KiB; format `ssh-ed25519` / `ssh-rsa` / `ecdsa-sha2-nistp*`.
 - Ownership: `creator_key` from device id; `anon` cannot mutate.
 - Revoke is idempotent; NVS delete failures still mark local `revoked`.
-- Generated private PEM is wiped from the DOM after register/close.
+- Generated private material is wiped from the DOM after register/close.
+- **Ed25519** private keys are emitted in native **OpenSSH** format (`-----BEGIN OPENSSH PRIVATE KEY-----`, filename `id_ed25519`) for direct `ssh -i id_ed25519`.
+- **ECDSA / RSA** private keys are PKCS#8 PEM. If a client rejects them, convert:
+  `ssh-keygen -p -N "" -m PEM -f key.pem` (or import via your agent).
+- `SSH_ALLOW_LOCAL_ACTIVATE=1` is **lab-only** (marks `active` without NVS); default is off.
 
 ### Database
 

@@ -400,6 +400,51 @@ EMERCOIN_RPC_URL = (_env("EMERCOIN_RPC_URL", "") or "").strip()
 EMERCOIN_RPC_USER = (_env("EMERCOIN_RPC_USER", "") or "").strip()
 EMERCOIN_RPC_PASS = (_env("EMERCOIN_RPC_PASS", "") or "").strip()
 EMERCOIN_NVS_DAYS = _env_int("EMERCOIN_NVS_DAYS", 365)
-SSH_MAX_KEYS_PER_DEVICE = _env_int("SSH_MAX_KEYS_PER_DEVICE", 20)
-
 SSH_ALLOW_LOCAL_ACTIVATE = (_env("SSH_ALLOW_LOCAL_ACTIVATE", "0") or "0").strip() in ("1", "true", "yes")
+
+# ── EmerSSH commercial tiers (NCH) ───────────────────────────────────────
+# Free: always available, capped keys. Paid: license TTL + higher key caps.
+SSH_TIERS = {
+    "free": {
+        "id": "free",
+        "label": "Spark",
+        "price_nch": 0,
+        "max_keys": _env_int("SSH_MAX_KEYS_FREE", 1),
+        "ttl_minutes": 0,
+        "hint": "1 key · free forever",
+    },
+    "flash": {
+        "id": "flash",
+        "label": "Flash",
+        "price_nch": _env_int("SSH_PRICE_FLASH_NCH", 80),
+        "max_keys": _env_int("SSH_MAX_KEYS_FLASH", 3),
+        "ttl_minutes": _env_int("SSH_TTL_FLASH_MIN", 10080),  # 7 days
+        "hint": "3 keys · 7 days",
+    },
+    "day": {
+        "id": "day",
+        "label": "Day",
+        "price_nch": _env_int("SSH_PRICE_DAY_NCH", 200),
+        "max_keys": _env_int("SSH_MAX_KEYS_DAY", 8),
+        "ttl_minutes": _env_int("SSH_TTL_DAY_MIN", 43200),  # 30 days
+        "hint": "8 keys · 30 days",
+    },
+    "week": {
+        "id": "week",
+        "label": "Week",
+        "price_nch": _env_int("SSH_PRICE_WEEK_NCH", 500),
+        "max_keys": _env_int("SSH_MAX_KEYS_WEEK", 20),
+        "ttl_minutes": _env_int("SSH_TTL_WEEK_MIN", 129600),  # 90 days
+        "hint": "20 keys · 90 days",
+    },
+    "month": {
+        "id": "month",
+        "label": "Month",
+        "price_nch": _env_int("SSH_PRICE_MONTH_NCH", 1200),
+        "max_keys": _env_int("SSH_MAX_KEYS_MONTH", 50),
+        "ttl_minutes": _env_int("SSH_TTL_MONTH_MIN", 525600),  # 365 days
+        "hint": "50 keys · 1 year",
+    },
+}
+# Legacy single-cap still honored as absolute ceiling across tiers
+SSH_MAX_KEYS_PER_DEVICE = _env_int("SSH_MAX_KEYS_PER_DEVICE", 50)

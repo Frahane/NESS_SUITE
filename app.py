@@ -782,6 +782,11 @@ def cleanup_expired():
         try:
             from storage import cleanup_expired_storage
             cleanup_expired_storage()
+            try:
+                from ssh import cleanup_ssh_expired
+                cleanup_ssh_expired()
+            except Exception as exc:
+                print(f"[SSH] cleanup error: {exc}")
         except Exception as _stg_exc:
             print(f"[CLEANUP] storage: {_stg_exc}")
 
@@ -1802,7 +1807,7 @@ def create_payment_intent():
     except Exception:
         body = {}
     product = (request.form.get("product") or body.get("product") or "mail").strip().lower()
-    if product not in ("mail", "burn", "storage", "wormhole"):
+    if product not in ("mail", "burn", "storage", "wormhole", "ssh"):
         return jsonify({"success": False, "error": "Invalid product"}), 400
     plan_id = (request.form.get("plan") or body.get("plan") or "").strip().lower()
 
@@ -2260,6 +2265,14 @@ ssh_product.register(app, {
     "_rate_global": _rate_global,
     "_client_device_id": _client_device_id,
     "_owner_key": _owner_key,
+    "_claim_tx": _claim_tx,
+    "_tx_already_used": _tx_already_used,
+    "verify_nch_payment_on_chain": verify_nch_payment_on_chain,
+    "ExplorerUnavailable": ExplorerUnavailable,
+    "PaymentVerificationError": PaymentVerificationError,
+    "_normalize_txid": _normalize_txid,
+    "_is_plausible_txid": _is_plausible_txid,
+    "_explorer_unavailable_payload": _explorer_unavailable_payload,
 })
 
 

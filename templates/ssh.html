@@ -52,15 +52,40 @@
     </div>
   </header>
 
+
+  <div class="card" id="plans-card">
+    <div class="section-label">Plans</div>
+    <p class="fineprint" style="margin-top:0;">Spark is free (1 registered public key). Paid plans raise how many public keys you can register, for a limited time — settled in NCH.</p>
+    <div class="purpose-grid" id="ssh-plans" role="listbox" aria-label="SSH plans"></div>
+    <p class="fineprint" id="entitlement-line">Current: Spark · 1 key</p>
+    <div id="ssh-pay" style="display:none;margin-top:1rem;">
+      <label class="field">
+        <span>Send NCH to</span>
+        <input type="text" id="ssh-pay-addr" class="ssh-input" readonly>
+      </label>
+      <div class="actions ssh-cmd-actions ssh-pay-copy-actions">
+        <button type="button" class="btn btn-sm" id="btn-copy-pay-addr">Copy address</button>
+      </div>
+      <p class="fineprint mono" id="ssh-pay-amount"></p>
+      <label class="field">
+        <span>Transaction hash</span>
+        <input type="text" id="ssh-pay-tx" class="ssh-input" placeholder="Paste tx hash after payment" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="actions ssh-cmd-actions">
+        <button type="button" class="btn" id="btn-ssh-verify">Verify payment</button>
+      </div>
+    </div>
+  </div>
+
   <div class="card" id="connect-card">
     <div class="section-label">Connect</div>
     <label class="field">
       <span>Server host</span>
-      <input type="text" id="ssh-host" class="ssh-input" placeholder="203.0.113.10 or server.example.com" autocomplete="off" spellcheck="false">
+      <input type="text" id="ssh-host" class="ssh-input" placeholder="203.0.113.10 or 203.0.113.10:4922" autocomplete="off" spellcheck="false">
     </label>
     <label class="field">
       <span>SSH command</span>
-      <input type="text" id="ssh-cmd" class="ssh-input" readonly placeholder="ssh user@203.0.113.10">
+      <input type="text" id="ssh-cmd" class="ssh-input" readonly placeholder="ssh -p 4922 user@203.0.113.10">
     </label>
     <div class="actions ssh-cmd-actions">
       <button type="button" class="btn btn-sm" id="btn-copy-cmd">Copy command</button>
@@ -75,7 +100,7 @@
       <div class="empty-icon">🔑</div>
       <p>No keys yet. Generate a pair or paste a public key.</p>
     </div>
-    <div id="keys-list" class="ssh-key-list"></div>
+    <div class="ssh-key-scroll" id="keys-scroll"><div id="keys-list" class="ssh-key-list"></div></div>
     <div class="actions" style="margin-top:1rem;">
       <button type="button" class="btn" id="btn-add-key">Add public key</button>
       <label class="field ssh-algo-field"><span>Key type</span><select id="gen-algo" class="ssh-input"><option value="ed25519" selected>Ed25519 (recommended)</option><option value="ecdsa256">ECDSA P-256</option><option value="ecdsa384">ECDSA P-384</option><option value="rsa2048">RSA 2048</option><option value="rsa4096">RSA 4096</option></select></label>
@@ -86,7 +111,7 @@
 
   <div class="card" id="gen-card" style="display:none;">
     <div class="section-label">Generated keypair</div>
-    <p class="fineprint warn-line">Save the private key now. It is shown once and never uploaded. PKCS#8 PEM works with modern OpenSSH.</p>
+    <p class="fineprint warn-line">Save the private key now. It is shown once and never uploaded. Ed25519 downloads as native OpenSSH (id_ed25519). ECDSA/RSA use PKCS#8 PEM — convert with: ssh-keygen -p -m PEM -f key.pem if needed.</p>
     <label class="field">
       <span>Private key (download &amp; protect)</span>
       <textarea id="gen-private" class="ssh-pubkey" rows="6" readonly spellcheck="false"></textarea>
@@ -104,7 +129,7 @@
       <input type="text" id="gen-username" placeholder="alice" maxlength="32" spellcheck="false">
     </label>
     <div class="actions" style="margin-top:1rem;">
-      <button type="button" class="btn" id="btn-register-gen">Register public key</button>
+      <button type="button" class="btn" id="btn-register-gen">Add public key</button>
       <button type="button" class="btn btn-ghost" id="btn-cancel-gen">Close</button>
     </div>
   </div>
