@@ -24,10 +24,13 @@ let activeWaAudio = null;
 
 const BURN_DRAFT_KEY = "ness_burn_draft_v1";
 const BURN_ACTIVE_KEY = "ness_burn_active_v1";
+const BURN_LIBRARY_KEY = "ness_burn_library_v1";
 const BURN_IDB_NAME = "ness_burn_idb";
 const BURN_IDB_STORE = "files";
 
 let activeDrop = null;
+let publisherReturnTo = null; // 'active' | 'mine' | null
+
 let timerInterval = null;
 
 function toast(msg, type) {
@@ -255,7 +258,10 @@ function saveBurnActive(data) {
       if (window.NessVault && NessVault.isUnlocked()) {
         const sealed = await NessVault.encryptJson(payload);
         localStorage.setItem(BURN_ACTIVE_KEY, JSON.stringify({ v: 2, enc: true, sealed: sealed }));
+      } else {
+        try { localStorage.setItem(BURN_ACTIVE_KEY, JSON.stringify(payload)); } catch (e2) {}
       }
+      try { upsertBurnLibrary(payload); } catch (e3) {}
     } catch (e) {}
   })();
 }
@@ -292,6 +298,44 @@ async function loadBurnActive() {
 function clearBurnActive() {
   try { localStorage.removeItem(BURN_ACTIVE_KEY); } catch (e) {}
 }
+
+function readBurnLibrary() {
+  try {
+    var raw = JSON.parse(localStorage.getItem(BURN_LIBRARY_KEY) || "[]");
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) { return []; }
+}
+
+function writeBurnLibrary(items) {
+  try {
+    localStorage.setItem(BURN_LIBRARY_KEY, JSON.stringify(items.slice(0, 40)));
+  } catch (e) {}
+}
+
+function upsertBurnLibrary(data) {
+  if (!data || !data.token) return;
+  var items = readBurnLibrary().filter(function (x) { return x && x.token !== data.token; });
+  items.unshift({
+    token: data.token,
+    plan: data.plan,
+    plan_label: data.plan_label,
+    badge_class: data.badge_class || "",
+    path: data.path || ("/burn/d/" + data.token),
+    expires_at: data.expires_at,
+    max_downloads: data.max_downloads,
+    burn_after: data.burn_after,
+    files: data.files || [],
+    saved_at: Date.now(),
+  });
+  // Drop clearly expired client-side
+  var now = Date.now();
+  items = items.filter(function (x) {
+    if (!x.expires_at) return true;
+    try { return new Date(x.expires_at).getTime() > now; } catch (e) { return true; }
+  });
+  writeBurnLibrary(items);
+}
+
 
 async function restoreBurnDraft() {
   let draft = null;
@@ -358,39 +402,47 @@ async function restoreBurnDraft() {
 }
 
 function restoreBurnActive() {
+  // Soft restore only: keep library / activeDrop memory for Manage.
+  // Never auto-open the management card on reload — home = plans + live list.
   loadBurnActive().then(function (saved) {
-  if (!saved || !saved.token) return;
-  const pathTok = (location.pathname || "").match(/\/burn\/d\/([A-Za-z0-9_\-]+)/);
-  if (pathTok) return;
+    if (!saved || !saved.token) return;
+    const pathTok = (location.pathname || "").match(/\/burn\/d\/([A-Za-z0-9_\-]+)/);
+    if (pathTok) return;
 
-  $.ajax({
-    url: "/api/burn/" + encodeURIComponent(saved.token),
-    headers: ajaxHeaders(),
-  })
-    .done(function (data) {
-      if (!data || !data.success) {
-        clearBurnActive();
-        return;
-      }
-      showActive({
-        token: saved.token,
-        plan: data.plan || saved.plan,
-        plan_label: saved.plan_label || data.plan,
-        path: "/burn/d/" + saved.token,
-        expires_at: data.expires_at || saved.expires_at,
-        max_downloads: data.max_downloads != null ? data.max_downloads : saved.max_downloads,
-        burn_after: data.burn_after != null ? data.burn_after : saved.burn_after,
-        files: data.files || saved.files || [],
-        badge_class: saved.badge_class || "",
-      });
+    $.ajax({
+      url: "/api/burn/" + encodeURIComponent(saved.token),
+      headers: ajaxHeaders(),
     })
-    .fail(function () {
-      if (saved.expires_at && new Date(saved.expires_at).getTime() > Date.now()) {
-        showActive(saved);
-      } else {
-        clearBurnActive();
-      }
-    });
+      .done(function (data) {
+        if (!data || !data.success) {
+          clearBurnActive();
+          return;
+        }
+        var payload = {
+          token: saved.token,
+          plan: data.plan || saved.plan,
+          plan_label: saved.plan_label || data.plan,
+          path: "/burn/d/" + saved.token,
+          expires_at: data.expires_at || saved.expires_at,
+          max_downloads: data.max_downloads != null ? data.max_downloads : saved.max_downloads,
+          burn_after: data.burn_after != null ? data.burn_after : saved.burn_after,
+          files: data.files || saved.files || [],
+          badge_class: saved.badge_class || "",
+        };
+        activeDrop = payload;
+        try { upsertBurnLibrary(payload); } catch (e) {}
+        try { saveBurnActive(payload); } catch (e2) {}
+        if (typeof loadMineDrops === "function") loadMineDrops();
+      })
+      .fail(function () {
+        if (saved.expires_at && new Date(saved.expires_at).getTime() > Date.now()) {
+          activeDrop = saved;
+          try { upsertBurnLibrary(saved); } catch (e) {}
+          if (typeof loadMineDrops === "function") loadMineDrops();
+        } else {
+          clearBurnActive();
+        }
+      });
   });
 }
 
@@ -595,6 +647,7 @@ function showPlansOnly(opts) {
   $("#compose-card").hide();
   $("#active-card").hide();
   $("#download-card").hide();
+  // activeDrop kept in memory for Manage — UI stays on home
   stopRecordingQuiet();
   discardPendingAudio();
   // Never persist on boot — that would wipe IndexedDB before restoreBurnDraft.
@@ -602,6 +655,7 @@ function showPlansOnly(opts) {
   if (opts.persistDraft === true) {
     try { saveBurnDraft(); } catch (e) {}
   }
+  if (typeof loadMineDrops === "function") loadMineDrops();
 }
 
 function showCompose() {
@@ -620,9 +674,11 @@ function showActive(data) {
   activeDrop = data;
   saveBurnActive(data);
   clearBurnDraft();
+  // Exclusive: management card only — never stack with mine list (same link twice)
   $("#plans-card").hide();
   $("#compose-card").hide();
   $("#download-card").hide();
+  if ($("#mine-card").length) $("#mine-card").hide();
   $("#active-card").show();
   $("#active-badge").attr("class", "badge " + (data.badge_class || "")).text(data.plan_label || data.plan);
   const link = location.origin + (data.path || ("/burn/d/" + data.token));
@@ -656,6 +712,174 @@ function renderFileList() {
   });
 }
 
+
+function loadMineDrops() {
+  var list = $("#mine-list");
+  var card = $("#mine-card");
+  if (!list.length || !card.length) return;
+
+  function renderItems(items) {
+    list.empty();
+    // Exclusive UI: management card owns the screen when visible
+    if ($("#active-card").length && $("#active-card").is(":visible")) {
+      card.hide();
+      return;
+    }
+    if (!items.length) {
+      card.hide();
+      return;
+    }
+    card.show();
+    items.forEach(function (it) {
+      var link = location.origin + (it.path || ("/burn/d/" + it.token));
+      var expLabel = "";
+      try {
+        if (it.expires_at) expLabel = formatRemain(it.expires_at);
+      } catch (e) {}
+      var shortId = (it.token || "").length > 12 ? (it.token.slice(0, 6) + "…" + it.token.slice(-4)) : (it.token || "");
+      var fileHint = "";
+      try {
+        var fl = it.files || [];
+        if (fl.length === 1) fileHint = fl[0].filename || fl[0].name || "";
+        else if (fl.length > 1) fileHint = fl.length + " files";
+      } catch (e2) {}
+      var row = $(
+        '<div class="burn-mine-row">' +
+          '<div class="burn-mine-main">' +
+            '<div class="burn-mine-head">' +
+              '<span class="badge ' + escapeHtml(it.badge_class || "") + '">' +
+                escapeHtml(it.plan_label || it.plan || "Drop") +
+              "</span>" +
+              (expLabel ? '<span class="timer burn-mine-ttl">' + escapeHtml(expLabel) + "</span>" : "") +
+            "</div>" +
+            (fileHint ? '<div class="burn-mine-file">' + escapeHtml(fileHint) + "</div>" : "") +
+            '<div class="burn-mine-id mono" title="' + escapeHtml(link) + '">/burn/d/' + escapeHtml(shortId) + "</div>" +
+          "</div>" +
+          '<div class="burn-mine-actions">' +
+            '<button type="button" class="btn btn-sm btn-mine-preview">Open</button>' +
+            '<button type="button" class="btn btn-sm btn-ghost btn-mine-manage">Manage</button>' +
+            '<button type="button" class="btn btn-sm btn-ghost btn-mine-copy" title="Copy public link" aria-label="Copy link">' +
+              '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
+            "</button>" +
+          "</div>" +
+        "</div>"
+      );
+      row.find(".btn-mine-preview").on("click", function () {
+        activeDrop = {
+          token: it.token,
+          plan: it.plan,
+          plan_label: it.plan_label,
+          badge_class: it.badge_class,
+          path: it.path,
+          expires_at: it.expires_at,
+          max_downloads: it.max_downloads,
+          burn_after: it.burn_after,
+          files: it.files || [],
+        };
+        if (typeof saveBurnActive === "function") saveBurnActive(activeDrop);
+        openPublisherPreview(it.token, "home");
+      });
+      row.find(".btn-mine-copy").on("click", function () {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(link).then(function () { toast("Link copied", "ok"); })
+            .catch(function () { toast("Copy failed", "err"); });
+        } else toast("Copy not available", "warn");
+      });
+      row.find(".btn-mine-open").on("click", function () {
+        window.open(link, "_blank", "noopener,noreferrer");
+      });
+      row.find(".btn-mine-manage").on("click", function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var payload = {
+          token: it.token,
+          plan: it.plan,
+          plan_label: it.plan_label,
+          badge_class: it.badge_class,
+          path: it.path || ("/burn/d/" + it.token),
+          expires_at: it.expires_at,
+          max_downloads: it.max_downloads,
+          burn_after: it.burn_after,
+          files: it.files || [],
+        };
+        showActive(payload);
+        history.replaceState({}, "", "/burn");
+        requestAnimationFrame(function () {
+          var el = document.getElementById("active-card");
+          if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+      });
+      list.append(row);
+    });
+  }
+
+  // Local library first (always available on this device)
+  var localItems = readBurnLibrary();
+  var byTok = {};
+  localItems.forEach(function (it) { if (it && it.token) byTok[it.token] = it; });
+
+  // Merge server-owned drops when device id is known
+  $.ajax({
+    url: "/api/burn/mine",
+    method: "GET",
+    headers: typeof ajaxHeaders === "function" ? ajaxHeaders() : {},
+  })
+    .done(function (data) {
+      var serverItems = (data && data.success && data.items) ? data.items : [];
+      serverItems.forEach(function (it) {
+        byTok[it.token] = it;
+        try { upsertBurnLibrary(it); } catch (e) {}
+      });
+      // Verify still-live via meta (prune burned/expired)
+      var tokens = Object.keys(byTok);
+      if (!tokens.length) { renderItems([]); return; }
+      var pending = tokens.length;
+      var live = [];
+      tokens.forEach(function (tok) {
+        $.ajax({
+          url: "/api/burn/" + encodeURIComponent(tok),
+          headers: typeof ajaxHeaders === "function" ? ajaxHeaders() : {},
+        })
+          .done(function (meta) {
+            if (meta && meta.success) {
+              var base = byTok[tok] || {};
+              live.push({
+                token: tok,
+                plan: meta.plan || base.plan,
+                plan_label: base.plan_label || meta.plan,
+                badge_class: base.badge_class || "",
+                path: base.path || ("/burn/d/" + tok),
+                expires_at: meta.expires_at || base.expires_at,
+                max_downloads: meta.max_downloads != null ? meta.max_downloads : base.max_downloads,
+                burn_after: meta.burn_after != null ? meta.burn_after : base.burn_after,
+                files: meta.files || base.files || [],
+              });
+            }
+          })
+          .always(function () {
+            pending -= 1;
+            if (pending <= 0) {
+              live.sort(function (a, b) {
+                return String(b.expires_at || "").localeCompare(String(a.expires_at || ""));
+              });
+              writeBurnLibrary(live);
+              renderItems(live);
+            }
+          });
+      });
+    })
+    .fail(function () {
+      // Offline / error — still show local library, prune client-side only
+      var now = Date.now();
+      var live = localItems.filter(function (x) {
+        if (!x || !x.token) return false;
+        if (!x.expires_at) return true;
+        try { return new Date(x.expires_at).getTime() > now; } catch (e) { return true; }
+      });
+      renderItems(live);
+    });
+}
+
 function tokenFromPath() {
   const m = location.pathname.match(/^\/burn\/d\/([A-Za-z0-9_\-]+)/);
   return m ? m[1] : null;
@@ -663,6 +887,11 @@ function tokenFromPath() {
 
 function openPay() {
   const t = TIERS[selectedPlanId] || {};
+  if (!selectedPlanId || !t.id || Number(t.price_nch) <= 0) {
+    toast("Select a paid plan before publishing", "warn");
+    showPlansOnly();
+    return;
+  }
   pendingIntentId = null;
   pendingIntentAmount = null;
   $("#pay-title").text("Activate " + (t.label || "plan"));
@@ -671,7 +900,12 @@ function openPay() {
   $("#pay-amount").html("…");
   $("#tx-hash").val("");
   $("#pay-modal").addClass("open");
-  $.post("/api/payment/intent", { product: "burn", plan: selectedPlanId })
+  $.ajax({
+    url: "/api/payment/intent",
+    method: "POST",
+    data: { product: "burn", plan: selectedPlanId },
+    headers: typeof ajaxHeaders === "function" ? ajaxHeaders() : {},
+  })
     .done(function (data) {
       if (!data || !data.success) {
         toast((data && data.error) || "Could not create payment intent", "err");
@@ -696,8 +930,15 @@ function openPay() {
       $("#pay-address").text(data.pay_address || PAY_ADDRESS);
       $("#pay-amount").html(Number(data.amount_nch).toLocaleString() + " <span>NCH</span>");
     })
-    .fail(function () {
-      toast("Could not create payment intent", "err");
+    .fail(function (xhr) {
+      var msg = "Could not create payment intent";
+      try {
+        var body = xhr.responseJSON || JSON.parse(xhr.responseText || "{}");
+        if (body && body.error) msg = body.error;
+      } catch (e) {}
+      if (xhr.status === 429) msg = "Too many payment attempts — wait a moment";
+      if (xhr.status === 503) msg = "Service busy — try again shortly";
+      toast(msg, "err");
       closePay();
     });
 }
@@ -964,7 +1205,8 @@ function createFree() {
       selectedFiles = [];
       renderFileList();
       showActive(data);
-      history.pushState({}, "", data.path);
+      /* stay on /burn — public path is share link only */
+history.replaceState({}, "", "/burn");
     })
     .fail(function (xhr) {
       $btn.prop("disabled", false).text("Publish");
@@ -1077,7 +1319,8 @@ function payAndUpload() {
       selectedFiles = [];
       renderFileList();
       showActive(data);
-      history.pushState({}, "", data.path);
+      /* stay on /burn — public path is share link only */
+history.replaceState({}, "", "/burn");
     })
     .fail(function (xhr) {
       $btn.prop("disabled", false).text("Publish");
@@ -1633,10 +1876,184 @@ function discardPendingAudio() {
   $("#rec-timer").text("0:00");
 }
 
-function loadDownload(token) {
+
+function setPublisherBar(visible) {
+  var bar = document.getElementById("publisher-bar");
+  if (!bar) return;
+  if (visible) {
+    bar.hidden = false;
+    bar.removeAttribute("hidden");
+  } else {
+    bar.hidden = true;
+    bar.setAttribute("hidden", "");
+  }
+}
+
+function closePublisherPreview() {
+  var ret = publisherReturnTo || "active";
+  publisherReturnTo = null;
+  setPublisherBar(false);
+  $("#download-card").hide();
+  $("#dl-preview").prop("hidden", true).empty();
+  $("#dl-files").empty();
+  history.replaceState({}, "", "/burn");
+  if (ret === "active" && activeDrop && activeDrop.token) {
+    showActive(activeDrop);
+    if (typeof loadMineDrops === "function") loadMineDrops();
+    return;
+  }
+  // Home / mine: plans + library
+  showPlansOnly();
+  if (typeof loadMineDrops === "function") loadMineDrops();
+}
+
+function openPublisherPreview(token, returnTo) {
+  token = token || (activeDrop && activeDrop.token);
+  if (!token) {
+    toast("No published drop selected", "warn");
+    return;
+  }
+  publisherReturnTo = returnTo || "active";
   $("#plans-card").hide();
   $("#compose-card").hide();
   $("#active-card").hide();
+  // Keep mine list memory but hide while previewing
+  if ($("#mine-card").length) $("#mine-card").hide();
+  $("#download-card").show();
+  setPublisherBar(true);
+  var lbl = document.getElementById("dl-section-label");
+  if (lbl) lbl.textContent = "Published content";
+  $("#dl-status").text("Loading your publication…");
+  $("#dl-files").empty();
+  $("#dl-preview").prop("hidden", true).empty();
+  $("#dl-password-wrap").prop("hidden", true);
+  var dlPw = document.getElementById("dl-password-wrap");
+  if (dlPw) {
+    dlPw.setAttribute("hidden", "");
+    dlPw.hidden = true;
+    dlPw.style.display = "none";
+  }
+
+  window.__burnDlToken = token;
+  window.__burnDlMeta = null;
+  window.__burnPreviewIdx = null;
+
+  $.ajax({
+    url: "/api/burn/" + encodeURIComponent(token) + "/publisher-open",
+    method: "POST",
+    headers: typeof ajaxHeaders === "function" ? ajaxHeaders() : {},
+  })
+    .done(function (data) {
+      if (!data || !data.success) {
+        $("#dl-status").text((data && data.error) || "Unavailable");
+        toast((data && data.error) || "Could not open publication", "err");
+        return;
+      }
+      window.__burnDlMeta = data;
+      var bits = ["Publisher preview"];
+      if (data.downloads_remaining != null) bits.push(data.downloads_remaining + " download(s) left");
+      bits.push(formatBytes(data.total_bytes || 0));
+      if (data.allow_view === false) bits.push("view off");
+      if (data.allow_download === false) bits.push("download off");
+      $("#dl-status").text(bits.join(" · "));
+      if (timerInterval) clearInterval(timerInterval);
+      function tick() { $("#dl-timer").text(formatRemain(data.expires_at)); }
+      tick();
+      timerInterval = setInterval(tick, 1000);
+      if (data.badge_class || data.plan_label) {
+        $("#dl-badge").attr("class", "badge " + (data.badge_class || "")).text(data.plan_label || data.plan || "Drop");
+      }
+      // Same renderer as public — visitor-accurate
+      renderDropAccess(token, data, data.view_token || "");
+      requestAnimationFrame(function () {
+        var card = document.getElementById("download-card");
+        if (card && typeof card.scrollIntoView === "function") {
+          card.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      });
+    })
+    .fail(function () {
+      // Ownership claim missing (legacy drops) — open public meta in publisher chrome
+      openPublisherPreviewPublicFallback(token);
+    });
+}
+
+function openPublisherPreviewPublicFallback(token) {
+  $.ajax({
+    url: "/api/burn/" + encodeURIComponent(token),
+    headers: typeof ajaxHeaders === "function" ? ajaxHeaders() : {},
+  })
+    .done(function (data) {
+      if (!data || !data.success) {
+        $("#dl-status").text((data && data.error) || "Unavailable");
+        toast((data && data.error) || "Could not open publication", "err");
+        return;
+      }
+      window.__burnDlMeta = data;
+      var bits = ["Preview"];
+      if (data.downloads_remaining != null) bits.push(data.downloads_remaining + " download(s) left");
+      bits.push(formatBytes(data.total_bytes || 0));
+      $("#dl-status").text(bits.join(" · "));
+      if (timerInterval) clearInterval(timerInterval);
+      function tick() { $("#dl-timer").text(formatRemain(data.expires_at)); }
+      tick();
+      timerInterval = setInterval(tick, 1000);
+      var dlPw = document.getElementById("dl-password-wrap");
+      if (data.password_required === true) {
+        if (dlPw) {
+          dlPw.removeAttribute("hidden");
+          dlPw.hidden = false;
+          dlPw.style.display = "flex";
+        }
+        $("#dl-files").empty();
+        $("#dl-preview").prop("hidden", true).empty();
+        $("#btn-dl-unlock").off("click").on("click", function () {
+          var pw = ($("#dl-password").val() || "").trim();
+          if (!pw) { toast("Enter the passphrase", "warn"); return; }
+          var $btn = $(this).prop("disabled", true).text("Unlocking…");
+          unlockBurnView(token, pw)
+            .done(function (viewToken) {
+              $btn.prop("disabled", false).text("Unlock");
+              renderDropAccess(token, data, viewToken);
+            })
+            .fail(function (xhr) {
+              $btn.prop("disabled", false).text("Unlock");
+              var msg = "Invalid passphrase";
+              try { msg = (xhr.responseJSON && xhr.responseJSON.error) || msg; } catch (e) {}
+              toast(msg, "err");
+            });
+        });
+        return;
+      }
+      if (dlPw) {
+        dlPw.setAttribute("hidden", "");
+        dlPw.hidden = true;
+        dlPw.style.display = "none";
+      }
+      renderDropAccess(token, data, "");
+    })
+    .fail(function (xhr) {
+      var msg = "Could not open publication";
+      try {
+        var body = xhr.responseJSON || JSON.parse(xhr.responseText || "{}");
+        if (body && body.error) msg = body.error;
+      } catch (e) {}
+      $("#dl-status").text(msg);
+      toast(msg, "err");
+    });
+}
+
+function loadDownload(token) {
+  // Public visitor path — not publisher preview
+  publisherReturnTo = null;
+  var bar = document.getElementById("publisher-bar");
+  if (bar) { bar.hidden = true; bar.setAttribute("hidden", ""); }
+  var lbl = document.getElementById("dl-section-label");
+  if (lbl) lbl.textContent = "Shared content";
+  $("#plans-card").hide();
+  $("#compose-card").hide();
+  $("#active-card").hide();
+  if ($("#mine-card").length) $("#mine-card").hide();
   $("#download-card").show();
   $("#dl-status").text("Loading…");
   $("#dl-files").empty();
@@ -1992,13 +2409,9 @@ $(function () {
   const vaultBoot = (window.NessVault ? NessVault.ensureVault() : Promise.resolve({ ok: true }));
   vaultBoot.then(function () {
     if (!pathTokBoot) {
-      loadBurnActive().then(function (savedActive) {
-        if (savedActive && savedActive.token) {
-          restoreBurnActive();
-        } else {
-          restoreBurnDraft().then(function () { /* compose draft restored */ });
-        }
-      });
+      // Home first (plans + live drops). Soft-restore library; draft only if no sticky manage UI.
+      restoreBurnActive();
+      restoreBurnDraft().then(function () { /* compose only if real in-progress draft */ });
     }
   });
 
@@ -2151,6 +2564,18 @@ $(function () {
     const a = $("#pay-address").text();
     if (navigator.clipboard) navigator.clipboard.writeText(a).then(function () { toast("Address copied", "ok"); });
   });
+  $("#btn-open-published").on("click", function () {
+    var tok = activeDrop && activeDrop.token;
+    if (!tok) { toast("No publication selected", "warn"); return; }
+    openPublisherPreview(tok, "active");
+  });
+  $("#btn-burn-home").on("click", function () {
+    showPlansOnly();
+    history.replaceState({}, "", "/burn");
+  });
+  $("#btn-publisher-back").on("click", function () {
+    closePublisherPreview();
+  });
   $("#btn-copy-link").on("click", function () {
     const a = $("#active-link").text();
     if (navigator.clipboard) navigator.clipboard.writeText(a).then(function () { toast("Link copied", "ok"); });
@@ -2246,8 +2671,12 @@ $(function () {
   });
 
   const tok = tokenFromPath();
-  if (tok) loadDownload(tok);
-  else showPlansOnly();
+  if (tok) {
+    loadDownload(tok);
+  } else {
+    showPlansOnly();
+    if (typeof loadMineDrops === "function") loadMineDrops();
+  }
 });
 
 

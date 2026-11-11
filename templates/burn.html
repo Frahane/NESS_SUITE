@@ -187,6 +187,12 @@
     </div>
   </div>
 
+  <div class="card" id="mine-card" style="display:none;">
+    <div class="section-label">Your live drops</div>
+    <p class="fineprint" style="margin-top:0;">Still active on this device. Open to view · Manage for link &amp; renew.</p>
+    <div id="mine-list" class="ssh-key-list"></div>
+  </div>
+
   <div class="card" id="active-card" style="display:none;">
     <div class="section-label">Published · live link</div>
     <div class="address-box">
@@ -201,13 +207,29 @@
     <p class="audio-fineprint" id="active-access-hint">Download slots can end the drop before the timer. Disable download on publish for view-only until expiry.</p>
     <ul class="file-list solid" id="active-files"></ul>
     <div class="actions">
+      <button type="button" class="btn btn-sm" id="btn-open-published" title="Open published content">
+        <svg class="btn-inline-svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+        Open
+      </button>
       <button type="button" class="btn btn-ghost btn-sm" id="btn-renew-drop">Renew</button>
       <button type="button" class="btn btn-ghost btn-sm" id="btn-new-drop">New drop</button>
     </div>
   </div>
 
   <div class="card" id="download-card" style="display:none;">
-    <div class="section-label">Shared content</div>
+    <div class="burn-pub-bar" id="publisher-bar" hidden>
+      <button type="button" class="burn-back-btn" id="btn-publisher-back" aria-label="Back to your drop">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M15 18l-6-6 6-6"/>
+        </svg>
+        <span>Back</span>
+      </button>
+      <span class="burn-pub-label">Publisher preview · as visitors see it</span>
+    </div>
+    <div class="section-label" id="dl-section-label">Shared content</div>
     <p class="dl-status" id="dl-status">Loading…</p>
     <div class="meta-row">
       <span class="badge plan-free" id="dl-badge">Drop</span>

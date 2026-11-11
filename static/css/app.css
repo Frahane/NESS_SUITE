@@ -1338,3 +1338,16 @@ body::before {
   color: var(--muted);
   line-height: 1.4;
 }
+
+
+.mail-recv-hint {
+  margin: 0.55rem 0 0.15rem;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--muted);
+  max-width: 36rem;
+}
+.mail-recv-hint strong {
+  color: var(--text);
+  font-weight: 600;
+}

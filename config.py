@@ -187,11 +187,11 @@ TIERS = {
         "attachments": True,
         "max_attachment_mb": 50,
         "priority": True,
-        "api_access": True,
+        "api_access": False,
         "ads": False,
         "price_nch": _env_int("PRICE_MONTH_NCH", 9000),
         "badge_class": "plan-month",
-        "tagline": "30 days. API access. Full power.",
+        "tagline": "30 days. Full power.",
     },
 }
 

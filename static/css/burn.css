@@ -519,3 +519,98 @@
   margin: -0.25rem 0 0.35rem 1.6rem;
   line-height: 1.45;
 }
+
+/* Publisher preview bar + back */
+.burn-pub-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0 0 0.85rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+.burn-pub-bar[hidden] { display: none !important; }
+.burn-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid var(--line);
+  background: var(--bg-elevated);
+  color: var(--text-hi);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.7rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: border-color var(--t), background var(--t);
+}
+.burn-back-btn:hover {
+  border-color: var(--line-hi);
+  background: var(--accent-dim);
+}
+.burn-back-btn svg { display: block; flex-shrink: 0; }
+.burn-pub-label {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.btn-inline-svg {
+  display: inline-block;
+  vertical-align: -0.2em;
+  margin-right: 0.3rem;
+}
+#btn-open-published {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Live drops list — compact, no duplicate URL walls */
+.burn-mine-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.burn-mine-row:last-child { border-bottom: none; }
+.burn-mine-main { min-width: 0; flex: 1; }
+.burn-mine-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.25rem;
+}
+.burn-mine-ttl { font-size: 0.85rem; }
+.burn-mine-file {
+  font-size: 0.82rem;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.burn-mine-id {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.15rem;
+}
+.burn-mine-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  flex-shrink: 0;
+  align-items: center;
+}
+.burn-mine-actions .btn { white-space: nowrap; }
+.burn-mine-actions .btn-mine-copy {
+  padding: 0.4rem 0.5rem;
+  min-width: auto;
+}
+.burn-mine-actions .btn-mine-copy svg { display: block; }
+@media (max-width: 480px) {
+  .burn-mine-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .burn-mine-actions { justify-content: flex-start; }
+}

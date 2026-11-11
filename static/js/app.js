@@ -69,7 +69,6 @@ function renderPlans() {
     else feats.push("Random address");
     if (t.attachments) feats.push("Attach ≤ " + t.max_attachment_mb + " MB");
     if (t.priority) feats.push("Priority inbox");
-    if (t.api_access) feats.push("API access");
     html += '<div class="plan' + sel + rec + '" data-plan="' + id + '" onclick="selectPlan(\'' + id + '\')">' +
       '<div class="plan-name">' + t.label + '</div>' +
       '<div class="plan-price">' + formatPrice(t.price_nch) + '</div>' +
@@ -662,7 +661,8 @@ function openPayModal(tier) {
   $("#tx-hash").val("");
   $("#btn-copy-pay").removeClass("copied");
   if ($("#pay-qr-wrap").length) $("#pay-qr-wrap").empty();
-  $("#pay-modal").css("display", "flex").hide().fadeIn(120);
+  // Design system: .overlay.open { display:flex }. Must set class so closePay can hide it.
+  $("#pay-modal").addClass("open").css("display", "flex");
   $.post("/api/payment/intent", { product: "mail", plan: tier.id || selectedPlanId || pendingUpgradePlan })
     .done(function (data) {
       if (!data || !data.success) {
@@ -711,9 +711,12 @@ function explorerFailMessage(d) {
 }
 
 function closePay() {
-  $("#pay-modal").removeClass("open");
+  // Always clear both class and inline display (open path used to set display:flex only).
+  $("#pay-modal").removeClass("open").stop(true, true).hide().css("display", "none");
   pendingUpgradePlan = null;
   mailRenewMode = false;
+  pendingIntentId = null;
+  pendingIntentAmount = null;
 }
 
 function copyPayAddress() {

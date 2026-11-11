@@ -82,6 +82,14 @@ def _init_burn_schema(get_db=None):
         conn.execute("ALTER TABLE burn_drops ADD COLUMN allow_view INTEGER NOT NULL DEFAULT 1")
     if "allow_download" not in cols:
         conn.execute("ALTER TABLE burn_drops ADD COLUMN allow_download INTEGER NOT NULL DEFAULT 1")
+    if "creator_key" not in cols:
+        conn.execute("ALTER TABLE burn_drops ADD COLUMN creator_key TEXT")
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_burn_creator ON burn_drops(creator_key)"
+        )
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -667,6 +675,61 @@ def _mount_routes(app, deps):
     def api_burn_tiers():
         return jsonify({"success": True, "tiers": _public_burn_tiers()})
 
+    @app.route("/api/burn/mine", methods=["GET"])
+    def api_burn_mine():
+        """List active (non-expired) drops owned by this device — publisher only."""
+        rate_global = deps.get("_rate_global")
+        if rate_global and not rate_global("burn_mine", limit=120, window=60):
+            return jsonify({"success": False, "error": "Service busy"}), 503
+        if not rate_ok(rate_key("burn_mine"), limit=30, window=60):
+            return jsonify({"success": False, "error": "Too many requests"}), 429
+        owner = "anon"
+        try:
+            owner = (client_device_id() or "anon").strip()
+        except Exception:
+            owner = "anon"
+        if owner == "anon":
+            return jsonify({"success": True, "items": []})
+        db = get_db()
+        now = datetime.now(timezone.utc).isoformat()
+        rows = db.execute(
+            """
+            SELECT public_token, plan, created_at, expires_at, max_downloads,
+                   download_count, burn_after, status, files_json, allow_view, allow_download
+              FROM burn_drops
+             WHERE creator_key = ?
+               AND status = 'active'
+               AND expires_at > ?
+             ORDER BY created_at DESC
+             LIMIT 50
+            """,
+            (owner, now),
+        ).fetchall()
+        items = []
+        for r in rows:
+            plan_id = r["plan"]
+            tier = BURN_TIERS.get(plan_id) or {}
+            try:
+                files = json.loads(r["files_json"] or "[]")
+            except Exception:
+                files = []
+            items.append({
+                "token": r["public_token"],
+                "plan": plan_id,
+                "plan_label": tier.get("label") or plan_id,
+                "badge_class": tier.get("badge_class") or "",
+                "created_at": r["created_at"],
+                "expires_at": r["expires_at"],
+                "max_downloads": r["max_downloads"],
+                "download_count": r["download_count"],
+                "burn_after": bool(r["burn_after"]),
+                "files": files,
+                "path": f"/burn/d/{r['public_token']}",
+                "allow_view": bool(r["allow_view"]) if r["allow_view"] is not None else True,
+                "allow_download": bool(r["allow_download"]) if r["allow_download"] is not None else True,
+            })
+        return jsonify({"success": True, "items": items})
+
     @app.route("/api/burn/create", methods=["POST"])
     def api_burn_create():
         oversized = _reject_oversized_request(jsonify, HAS_FLASK)
@@ -680,6 +743,10 @@ def _mount_routes(app, deps):
 
         plan_id = _safe_burn_plan(request.form.get("plan") or "free") or "free"
         tier = BURN_TIERS[plan_id]
+        try:
+            owner = (client_device_id() or "anon").strip()
+        except Exception:
+            owner = "anon"
         if tier["price_nch"] > 0:
             return jsonify({
                 "success": False,
@@ -779,8 +846,8 @@ def _mount_routes(app, deps):
             """INSERT INTO burn_drops
                (public_token, plan, created_at, expires_at, max_downloads,
                 burn_after, password_hash, total_bytes, files_json, status,
-                allow_view, allow_download)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                allow_view, allow_download, creator_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)""",
             (
                 token,
                 plan_id,
@@ -793,6 +860,7 @@ def _mount_routes(app, deps):
                 json.dumps(meta_files),
                 allow_view,
                 allow_download,
+                owner if owner != "anon" else None,
             ),
         )
         db.commit()
@@ -812,10 +880,11 @@ def _mount_routes(app, deps):
 
     @app.route("/api/burn/pay", methods=["POST"])
     def api_burn_pay():
-        """Pay for a burn plan, then client uploads with the granted upload_token... 
-        Simpler MVP: pay creates a paid 'slot' stored in session-less form —
-        client sends files in same request after tx verify (multipart + tx_hash).
-        """
+        """Pay for a burn plan; multipart files + tx_hash + intent_id in one request."""
+        try:
+            owner = (client_device_id() or "anon").strip()
+        except Exception:
+            owner = "anon"
         oversized = _reject_oversized_request(jsonify, HAS_FLASK)
         if oversized is not None:
             return oversized
@@ -961,14 +1030,14 @@ def _mount_routes(app, deps):
                 """INSERT INTO burn_drops
                    (public_token, plan, created_at, expires_at, max_downloads,
                     burn_after, password_hash, transaction_hash, amount_nch,
-                    total_bytes, files_json, status, allow_view, allow_download)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                    total_bytes, files_json, status, allow_view, allow_download, creator_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)""",
                 (
                     token, plan_id, now.isoformat(), expires.isoformat(),
                     int(tier["max_downloads"]), burn_after, pw_hash,
                     chain["txid"], int(chain["hours_received"]),
                     total, json.dumps(meta_files),
-                    allow_view, allow_download,
+                    allow_view, allow_download, owner,
                 ),
             )
             db.commit()
@@ -990,6 +1059,99 @@ def _mount_routes(app, deps):
             "path": f"/burn/d/{token}",
             "hours_received": int(chain["hours_received"]),
             "txid": chain["txid"],
+        })
+
+    @app.route("/api/burn/<token>/publisher-open", methods=["POST"])
+    def api_burn_publisher_open(token):
+        """Publisher-only: open own drop without passphrase (device ownership)."""
+        rate_global = deps.get("_rate_global")
+        if rate_global and not rate_global("burn_pub_open", limit=60, window=60):
+            return jsonify({"success": False, "error": "Service busy"}), 503
+        if not rate_ok(rate_key("burn_pub_open"), limit=20, window=60):
+            return jsonify({"success": False, "error": "Too many requests"}), 429
+        try:
+            owner = (client_device_id() or "anon").strip()
+        except Exception:
+            owner = "anon"
+        if owner == "anon":
+            return jsonify({"success": False, "error": "Device identity required"}), 403
+        db = get_db()
+        row = db.execute(
+            "SELECT * FROM burn_drops WHERE public_token = ?",
+            (token,),
+        ).fetchone()
+        if not row:
+            return jsonify({"success": False, "error": "Drop not found"}), 404
+        ck = None
+        try:
+            ck = row["creator_key"]
+        except (KeyError, IndexError):
+            ck = None
+        if ck and ck != owner:
+            return jsonify({"success": False, "error": "Not your drop"}), 403
+        # Legacy drops (no creator_key): bind to this device on first publisher open.
+        # public_token is high-entropy — knowledge of the link is the capability.
+        if not ck and owner and owner != "anon":
+            try:
+                db.execute(
+                    "UPDATE burn_drops SET creator_key = ? WHERE public_token = ? AND (creator_key IS NULL OR creator_key = '')",
+                    (owner, token),
+                )
+                db.commit()
+            except Exception:
+                pass
+        now = datetime.now(timezone.utc)
+        exp = datetime.fromisoformat(row["expires_at"])
+        if row["status"] != "active" or exp <= now:
+            return jsonify({
+                "success": False,
+                "error": "This drop has expired and burned",
+                "status": row["status"],
+            }), 410
+        files = json.loads(row["files_json"] or "[]")
+        try:
+            allow_view = bool(row["allow_view"])
+        except (KeyError, IndexError):
+            allow_view = True
+        try:
+            allow_download = bool(row["allow_download"])
+        except (KeyError, IndexError):
+            allow_download = True
+        # Issue view session so inline/file fetches work without passphrase
+        vt = _issue_view_session(token)
+        tier = BURN_TIERS.get(row["plan"]) or {}
+        return jsonify({
+            "success": True,
+            "view_token": vt,
+            "token": token,
+            "plan": row["plan"],
+            "plan_label": tier.get("label") or row["plan"],
+            "badge_class": tier.get("badge_class") or "",
+            "expires_at": row["expires_at"],
+            "max_downloads": row["max_downloads"],
+            "download_count": row["download_count"],
+            "downloads_remaining": max(0, int(row["max_downloads"]) - int(row["download_count"])),
+            "burn_after": bool(row["burn_after"]),
+            "password_required": False,  # publisher path — already authorized
+            "allow_view": allow_view,
+            "allow_download": allow_download,
+            "files": [
+                {
+                    "filename": f["filename"],
+                    "size": f["size"],
+                    "content_type": f.get("content_type"),
+                    "kind": (
+                        "note" if (f.get("filename") or "").endswith(".html")
+                        else "audio" if str(f.get("content_type") or "").startswith("audio/")
+                        else "image" if str(f.get("content_type") or "").startswith("image/")
+                        else "file"
+                    ),
+                }
+                for f in files
+            ],
+            "total_bytes": row["total_bytes"],
+            "path": f"/burn/d/{token}",
+            "publisher": True,
         })
 
     @app.route("/api/burn/<token>", methods=["GET"])
