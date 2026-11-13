@@ -212,17 +212,27 @@ $.ajaxSetup({
 });
 
 function saveSession(data) {
-  try {
-    localStorage.setItem(SESSION_KEY, JSON.stringify({
-      token: data.token,
-      address: data.address,
-      plan: data.plan,
-      plan_label: data.plan_label,
-      badge_class: data.badge_class,
-      max_messages: data.max_messages,
-      expires_at: data.expires_at,
-    }));
-  } catch (e) {}
+  (async function () {
+    try {
+      const payload = {
+        token: data.token,
+        address: data.address,
+        plan: data.plan,
+        plan_label: data.plan_label,
+        badge_class: data.badge_class,
+        max_messages: data.max_messages,
+        expires_at: data.expires_at,
+      };
+      if (window.NessVault && !NessVault.isUnlocked()) {
+        await NessVault.ensureVault();
+      }
+      if (window.NessVault && NessVault.isUnlocked()) {
+        const sealed = await NessVault.encryptJson(payload);
+        localStorage.setItem(SESSION_KEY, JSON.stringify({ v: 2, enc: true, sealed: sealed }));
+      }
+      // Fail closed if vault unavailable — mailbox token stays only in memory
+    } catch (e) {}
+  })();
 }
 
 function clearSession() {
@@ -230,13 +240,35 @@ function clearSession() {
 }
 
 function loadSession() {
+  // Sync path cannot decrypt — returns null; restoreSession uses loadSessionAsync
   try {
     const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     const sess = JSON.parse(raw);
-    // Drop legacy sessions that only stored sequential mailbox_id
-    if (!sess || !sess.token) return null;
-    return sess;
+    if (sess && sess.enc && sess.sealed) return null;
+    // Legacy plaintext: wipe
+    if (sess && sess.token && !sess.enc) {
+      try { localStorage.removeItem(SESSION_KEY); } catch (e2) {}
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function loadSessionAsync() {
+  try {
+    if (window.NessVault && !NessVault.isUnlocked()) await NessVault.ensureVault();
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const sess = JSON.parse(raw);
+    if (sess && sess.enc && sess.sealed && window.NessVault && NessVault.isUnlocked()) {
+      return await NessVault.decryptJson(sess.sealed);
+    }
+    if (sess && sess.token && !sess.enc) {
+      try { localStorage.removeItem(SESSION_KEY); } catch (e2) {}
+    }
+    return null;
   } catch (e) {
     return null;
   }
@@ -273,7 +305,13 @@ function activateMailboxUI(data, opts) {
 }
 
 function restoreSession() {
-  const sess = loadSession();
+  loadSessionAsync().then(function (sess) {
+    if (!sess || !sess.token) return;
+    _restoreSessionFrom(sess);
+  });
+}
+
+function _restoreSessionFrom(sess) {
   if (!sess || !sess.token) return;
 
   // Optimistic UI from cache while we validate with the server

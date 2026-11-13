@@ -187,13 +187,13 @@ function setPayBtnBusy($btn, busy, idleLabel) {
       var raw = localStorage.getItem(PAY_LIST_KEY);
       if (!raw) return [];
       var parsed = JSON.parse(raw);
-      // Encrypted envelope
+      // Encrypted envelope: only after hydrateLinkList
       if (parsed && parsed.enc && parsed.sealed) {
-        return _linkListCache ? _linkListCache.slice() : [];
+        return [];
       }
-      if (Array.isArray(parsed)) {
-        _linkListCache = parsed.filter(Boolean);
-        return _linkListCache.slice();
+      // Legacy plaintext list — wipe capability metadata
+      if (Array.isArray(parsed) && parsed.length) {
+        try { localStorage.removeItem(PAY_LIST_KEY); } catch (e2) {}
       }
       return [];
     } catch (e) {
@@ -248,10 +248,14 @@ function setPayBtnBusy($btn, busy, idleLabel) {
       if (window.NessVault && !NessVault.isUnlocked()) {
         await NessVault.ensureVault();
       }
-      if (window.NessVault && NessVault.isUnlocked()) {
-        var sealed = await NessVault.encryptJson(_linkListCache);
-        localStorage.setItem(PAY_LIST_KEY, JSON.stringify({ v: 2, enc: true, sealed: sealed }));
+      if (window.NessVault && !NessVault.isUnlocked()) {
+        await NessVault.ensureVault();
       }
+      if (!(window.NessVault && NessVault.isUnlocked())) {
+        return; // fail closed — no plaintext link list
+      }
+      var sealed = await NessVault.encryptJson(_linkListCache);
+      localStorage.setItem(PAY_LIST_KEY, JSON.stringify({ v: 2, enc: true, sealed: sealed }));
     } catch (e) {}
   }
 

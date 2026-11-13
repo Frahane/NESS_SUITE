@@ -26,7 +26,168 @@ const BURN_DRAFT_KEY = "ness_burn_draft_v1";
 const BURN_ACTIVE_KEY = "ness_burn_active_v1";
 const BURN_LIBRARY_KEY = "ness_burn_library_v1";
 const BURN_IDB_NAME = "ness_burn_idb";
+
 const BURN_IDB_STORE = "files";
+
+/* ── E2E content encryption (server stores ciphertext only) ─────────────
+ * File format: 12-byte IV || AES-GCM ciphertext+tag
+ * DEK wrap:
+ *   - passphrase mode: PBKDF2-SHA256 → AES-GCM wrap of DEK
+ *   - link mode: random 32-byte link key in URL #k= (never sent to server)
+ */
+var __burnLinkKey = null; // base64url, for open drops after publish
+var __burnContentKey = null; // CryptoKey DEK while viewing
+
+function burnB64urlEnc(buf) {
+  var bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer || buf);
+  var s = "";
+  for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function burnB64urlDec(str) {
+  str = String(str || "").replace(/-/g, "+").replace(/_/g, "/");
+  while (str.length % 4) str += "=";
+  var bin = atob(str);
+  var out = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+function burnB64Enc(buf) {
+  var bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer || buf);
+  var s = "";
+  for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+function burnB64Dec(str) {
+  var bin = atob(str);
+  var out = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+
+async function burnE2E_wrapDek(rawDek, passphrase) {
+  if (passphrase) {
+    var salt = crypto.getRandomValues(new Uint8Array(16));
+    var iters = 120000;
+    var base = await crypto.subtle.importKey("raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+    var wrapKey = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: salt, iterations: iters, hash: "SHA-256" },
+      base,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt"]
+    );
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    var ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, wrapKey, rawDek);
+    return {
+      mode: "passphrase",
+      salt: burnB64Enc(salt),
+      iters: iters,
+      iv: burnB64Enc(iv),
+      ct: burnB64Enc(ct),
+    };
+  }
+  var linkKey = crypto.getRandomValues(new Uint8Array(32));
+  var wk = await crypto.subtle.importKey("raw", linkKey, { name: "AES-GCM" }, false, ["encrypt"]);
+  var iv2 = crypto.getRandomValues(new Uint8Array(12));
+  var ct2 = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv2 }, wk, rawDek);
+  return {
+    wrap: {
+      mode: "link",
+      iv: burnB64Enc(iv2),
+      ct: burnB64Enc(ct2),
+    },
+    linkKeyB64: burnB64urlEnc(linkKey),
+  };
+}
+
+async function burnE2E_unwrapDek(encMeta, secret) {
+  // secret = passphrase string OR link key ArrayBuffer
+  var wrap = (encMeta && encMeta.wrap) || {};
+  if (wrap.mode === "passphrase") {
+    var salt = burnB64Dec(wrap.salt);
+    var iters = parseInt(wrap.iters, 10) || 120000;
+    var base = await crypto.subtle.importKey("raw", new TextEncoder().encode(String(secret || "")), "PBKDF2", false, ["deriveKey"]);
+    var wrapKey = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: salt, iterations: iters, hash: "SHA-256" },
+      base,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["decrypt"]
+    );
+    var iv = burnB64Dec(wrap.iv);
+    var ct = burnB64Dec(wrap.ct);
+    var raw = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(iv) }, wrapKey, ct);
+    return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["decrypt"]);
+  }
+  if (wrap.mode === "link") {
+    var lk = secret instanceof ArrayBuffer ? secret : burnB64urlDec(secret);
+    var wk = await crypto.subtle.importKey("raw", lk, { name: "AES-GCM" }, false, ["decrypt"]);
+    var ivL = burnB64Dec(wrap.iv);
+    var ctL = burnB64Dec(wrap.ct);
+    var rawL = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(ivL) }, wk, ctL);
+    return crypto.subtle.importKey("raw", rawL, { name: "AES-GCM" }, false, ["decrypt"]);
+  }
+  throw new Error("Unknown wrap mode");
+}
+
+async function burnE2E_encryptFile(file, dek) {
+  var iv = crypto.getRandomValues(new Uint8Array(12));
+  var buf = await file.arrayBuffer();
+  var ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, dek, buf);
+  var out = new Uint8Array(12 + ct.byteLength);
+  out.set(iv, 0);
+  out.set(new Uint8Array(ct), 12);
+  return new File([out], file.name, { type: file.type || "application/octet-stream" });
+}
+
+async function burnE2E_decryptBytes(cipherBuf, dek) {
+  var u = new Uint8Array(cipherBuf);
+  if (u.length < 13) throw new Error("ciphertext too short");
+  var iv = u.slice(0, 12);
+  var ct = u.slice(12);
+  return crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, dek, ct);
+}
+
+async function burnE2E_buildEnvelope(fileList, passphrase) {
+  if (!window.crypto || !crypto.subtle) throw new Error("WebCrypto unavailable");
+  var dek = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+  var outFiles = [];
+  for (var i = 0; i < fileList.length; i++) {
+    outFiles.push(await burnE2E_encryptFile(fileList[i], dek));
+  }
+  var rawDek = await crypto.subtle.exportKey("raw", dek);
+  var linkKeyB64 = null;
+  var wrap;
+  if (passphrase) {
+    wrap = await burnE2E_wrapDek(rawDek, passphrase);
+  } else {
+    var packed = await burnE2E_wrapDek(rawDek, null);
+    wrap = packed.wrap;
+    linkKeyB64 = packed.linkKeyB64;
+  }
+  return {
+    files: outFiles,
+    encMeta: { v: 1, alg: "AES-GCM-256", wrap: wrap },
+    linkKeyB64: linkKeyB64,
+  };
+}
+
+function burnLinkKeyFromLocation() {
+  try {
+    var h = String(location.hash || "");
+    var m = h.match(/(?:^|[&#])k=([A-Za-z0-9_\-]+)/);
+    return m ? m[1] : null;
+  } catch (e) { return null; }
+}
+
+function burnSharePath(token, linkKeyB64) {
+  var p = "/burn/d/" + token;
+  if (linkKeyB64) p += "#k=" + linkKeyB64;
+  return p;
+}
+
+
 
 let activeDrop = null;
 let publisherReturnTo = null; // 'active' | 'mine' | null
@@ -253,15 +414,14 @@ function saveBurnActive(data) {
         burn_after: data.burn_after,
         files: data.files || [],
         badge_class: data.badge_class || "",
+        link_key: data.link_key || __burnLinkKey || null,
         saved_at: Date.now(),
       };
-      if (window.NessVault && NessVault.isUnlocked()) {
-        const sealed = await NessVault.encryptJson(payload);
-        localStorage.setItem(BURN_ACTIVE_KEY, JSON.stringify({ v: 2, enc: true, sealed: sealed }));
-      } else {
-        try { localStorage.setItem(BURN_ACTIVE_KEY, JSON.stringify(payload)); } catch (e2) {}
-      }
-      try { upsertBurnLibrary(payload); } catch (e3) {}
+      // Fail closed: never persist capability tokens in plaintext
+      if (!(window.NessVault && NessVault.isUnlocked())) return;
+      const sealed = await NessVault.encryptJson(payload);
+      localStorage.setItem(BURN_ACTIVE_KEY, JSON.stringify({ v: 2, enc: true, sealed: sealed }));
+      try { await upsertBurnLibrary(payload); } catch (e3) {}
     } catch (e) {}
   })();
 }
@@ -272,7 +432,10 @@ function loadBurnActiveSyncMeta() {
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (parsed && parsed.enc) return { enc: true };
-    if (parsed && parsed.token) return parsed;
+    // Legacy plaintext: wipe
+    if (parsed && parsed.token && !parsed.enc) {
+      try { localStorage.removeItem(BURN_ACTIVE_KEY); } catch (e2) {}
+    }
     return null;
   } catch (e) {
     return null;
@@ -285,10 +448,13 @@ async function loadBurnActive() {
     const raw = localStorage.getItem(BURN_ACTIVE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (parsed && parsed.enc && parsed.sealed) {
+    if (parsed && parsed.enc && parsed.sealed && window.NessVault && NessVault.isUnlocked()) {
       return await NessVault.decryptJson(parsed.sealed);
     }
-    if (parsed && parsed.token && !parsed.enc) return parsed;
+    // Legacy plaintext active record: wipe — do not rehydrate secrets in clear
+    if (parsed && parsed.token && !parsed.enc) {
+      try { localStorage.removeItem(BURN_ACTIVE_KEY); } catch (e2) {}
+    }
     return null;
   } catch (e) {
     return null;
@@ -299,22 +465,74 @@ function clearBurnActive() {
   try { localStorage.removeItem(BURN_ACTIVE_KEY); } catch (e) {}
 }
 
+var _burnLibraryCache = null;
+
 function readBurnLibrary() {
+  // Sync cache only — never return decrypted-from-disk without hydrate
+  if (_burnLibraryCache) return _burnLibraryCache.slice();
   try {
-    var raw = JSON.parse(localStorage.getItem(BURN_LIBRARY_KEY) || "[]");
-    return Array.isArray(raw) ? raw : [];
+    var raw = localStorage.getItem(BURN_LIBRARY_KEY);
+    if (!raw) return [];
+    var parsed = JSON.parse(raw);
+    // Encrypted envelope: wait for hydrateBurnLibrary()
+    if (parsed && parsed.enc && parsed.sealed) return [];
+    // Legacy plaintext list: wipe immediately (capability tokens)
+    if (Array.isArray(parsed) && parsed.length) {
+      try { localStorage.removeItem(BURN_LIBRARY_KEY); } catch (e2) {}
+    }
+    return [];
   } catch (e) { return []; }
 }
 
-function writeBurnLibrary(items) {
+async function hydrateBurnLibrary() {
   try {
-    localStorage.setItem(BURN_LIBRARY_KEY, JSON.stringify(items.slice(0, 40)));
+    if (window.NessVault && !NessVault.isUnlocked()) await NessVault.ensureVault();
+    var raw = localStorage.getItem(BURN_LIBRARY_KEY);
+    if (!raw) {
+      _burnLibraryCache = [];
+      return [];
+    }
+    var parsed = JSON.parse(raw);
+    if (parsed && parsed.enc && parsed.sealed && window.NessVault && NessVault.isUnlocked()) {
+      var dec = await NessVault.decryptJson(parsed.sealed);
+      _burnLibraryCache = Array.isArray(dec) ? dec : [];
+      return _burnLibraryCache.slice();
+    }
+    if (Array.isArray(parsed)) {
+      // Migrate once under vault, then discard plaintext form
+      _burnLibraryCache = parsed.filter(Boolean).slice(0, 40);
+      await persistBurnLibrary(_burnLibraryCache);
+      return _burnLibraryCache.slice();
+    }
+    _burnLibraryCache = [];
+    return [];
+  } catch (e) {
+    _burnLibraryCache = [];
+    return [];
+  }
+}
+
+async function persistBurnLibrary(items) {
+  _burnLibraryCache = (items || []).slice(0, 40);
+  try {
+    if (window.NessVault && !NessVault.isUnlocked()) await NessVault.ensureVault();
+    if (!(window.NessVault && NessVault.isUnlocked())) return; // fail closed
+    var sealed = await NessVault.encryptJson(_burnLibraryCache);
+    localStorage.setItem(BURN_LIBRARY_KEY, JSON.stringify({ v: 2, enc: true, sealed: sealed }));
   } catch (e) {}
 }
 
-function upsertBurnLibrary(data) {
+function writeBurnLibrary(items) {
+  _burnLibraryCache = (items || []).slice(0, 40);
+  persistBurnLibrary(_burnLibraryCache);
+}
+
+async function upsertBurnLibrary(data) {
   if (!data || !data.token) return;
-  var items = readBurnLibrary().filter(function (x) { return x && x.token !== data.token; });
+  if (!_burnLibraryCache) {
+    try { await hydrateBurnLibrary(); } catch (e) {}
+  }
+  var items = (_burnLibraryCache || []).filter(function (x) { return x && x.token !== data.token; });
   items.unshift({
     token: data.token,
     plan: data.plan,
@@ -327,13 +545,12 @@ function upsertBurnLibrary(data) {
     files: data.files || [],
     saved_at: Date.now(),
   });
-  // Drop clearly expired client-side
   var now = Date.now();
   items = items.filter(function (x) {
     if (!x.expires_at) return true;
     try { return new Date(x.expires_at).getTime() > now; } catch (e) { return true; }
   });
-  writeBurnLibrary(items);
+  await persistBurnLibrary(items);
 }
 
 
@@ -681,8 +898,22 @@ function showActive(data) {
   if ($("#mine-card").length) $("#mine-card").hide();
   $("#active-card").show();
   $("#active-badge").attr("class", "badge " + (data.badge_class || "")).text(data.plan_label || data.plan);
-  const link = location.origin + (data.path || ("/burn/d/" + data.token));
+  var path = data.path || ("/burn/d/" + data.token);
+  if (data.link_key && path.indexOf("#k=") === -1) {
+    path = burnSharePath(data.token, data.link_key);
+  } else if (__burnLinkKey && path.indexOf("#k=") === -1 && !data.password_required) {
+    path = burnSharePath(data.token, __burnLinkKey);
+  }
+  const link = (path.indexOf("http") === 0) ? path : (location.origin + path);
   $("#active-link").text(link);
+  if (link.indexOf("#k=") !== -1) {
+    try {
+      if (!window.__burnKeyWarnShown) {
+        window.__burnKeyWarnShown = true;
+        toast("Open links include a secret #k= fragment — copy the full URL", "warn");
+      }
+    } catch (e) {}
+  }
   $("#active-cap").text(
     (data.max_downloads || "—") + " DL" + (data.burn_after ? " · burn" : "")
   );
@@ -899,7 +1130,8 @@ function openPay() {
   $("#pay-address").text(typeof PAY_ADDRESS !== "undefined" ? PAY_ADDRESS : "—");
   $("#pay-amount").html("…");
   $("#tx-hash").val("");
-  $("#pay-modal").addClass("open");
+  // Must clear any inline display:none left by closePay (class alone cannot override it)
+  $("#pay-modal").addClass("open").stop(true, true).css("display", "flex").show();
   $.ajax({
     url: "/api/payment/intent",
     method: "POST",
@@ -947,9 +1179,10 @@ function openPay() {
 var burnRenewMode = false;
 
 function closePay() {
-  $("#pay-modal").removeClass("open").hide();
-  try { $("#pay-modal").css("display", "none"); } catch (e) {}
+  $("#pay-modal").removeClass("open").stop(true, true).hide().css("display", "none");
   burnRenewMode = false;
+  pendingIntentId = null;
+  pendingIntentAmount = null;
 }
 
 function validateFilesAgainstPlan() {
@@ -1049,15 +1282,25 @@ function updateNoteCount() {
 }
 
 
-/** Re-encode raster images on-device to drop EXIF/GPS (journalism / anti-doxxing). */
+/** Re-encode raster images on-device to drop EXIF/GPS (journalism / anti-doxxing).
+ * Fail-closed: never returns the original file. SVG is refused (embedded metadata / script risk).
+ */
 function stripImageMetadata(file) {
-  return new Promise(function (resolve) {
+  return new Promise(function (resolve, reject) {
     if (!file || !file.type || file.type.indexOf("image/") !== 0) {
       resolve(file);
       return;
     }
-    if (file.type === "image/svg+xml") {
-      resolve(file);
+    var type = (file.type || "").toLowerCase();
+    var name = String(file.name || "").toLowerCase();
+    if (type === "image/svg+xml" || name.endsWith(".svg") || name.endsWith(".svgz")) {
+      reject(new Error("SVG images are not allowed (metadata and script risk). Use PNG or JPEG."));
+      return;
+    }
+    // HEIC/HEIF often cannot be decoded by canvas in many browsers — refuse rather than pass-through
+    if (type.indexOf("heic") !== -1 || type.indexOf("heif") !== -1 ||
+        name.endsWith(".heic") || name.endsWith(".heif")) {
+      reject(new Error("HEIC/HEIF not supported for metadata stripping. Convert to JPEG or PNG first."));
       return;
     }
     const url = URL.createObjectURL(file);
@@ -1067,6 +1310,11 @@ function stripImageMetadata(file) {
         const max = 4096;
         let w = img.naturalWidth || img.width;
         let h = img.naturalHeight || img.height;
+        if (!w || !h) {
+          URL.revokeObjectURL(url);
+          reject(new Error("Could not read image dimensions — file refused."));
+          return;
+        }
         if (w > max || h > max) {
           const s = Math.min(max / w, max / h);
           w = Math.round(w * s);
@@ -1076,11 +1324,16 @@ function stripImageMetadata(file) {
         canvas.width = w;
         canvas.height = h;
         const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          URL.revokeObjectURL(url);
+          reject(new Error("Canvas unavailable — image refused to protect metadata."));
+          return;
+        }
         ctx.drawImage(img, 0, 0, w, h);
         canvas.toBlob(function (blob) {
           URL.revokeObjectURL(url);
-          if (!blob) {
-            resolve(file);
+          if (!blob || blob.size < 32) {
+            reject(new Error("Image re-encode failed — file refused (metadata not stripped)."));
             return;
           }
           // Neutral filename — no original name leakage
@@ -1089,22 +1342,236 @@ function stripImageMetadata(file) {
         }, "image/jpeg", 0.92);
       } catch (e) {
         URL.revokeObjectURL(url);
-        resolve(file);
+        reject(new Error("Image re-encode failed — file refused (metadata not stripped)."));
       }
     };
     img.onerror = function () {
       URL.revokeObjectURL(url);
-      resolve(file);
+      reject(new Error("Could not decode image — file refused (metadata not stripped)."));
     };
+    // Avoid accidental credentialed loads; blob: URLs are local
+    img.referrerPolicy = "no-referrer";
     img.src = url;
   });
 }
 
 function sanitizeAttachmentName(name) {
-  const base = String(name || "file").split(/[/\\\\]/).pop();
-  // Drop path, collapse identity-like long names to generic
+  const base = String(name || "file").split(/[/\\]/).pop();
   const ext = (base.match(/(\.[a-zA-Z0-9]{1,8})$/) || [])[1] || "";
   return "file-" + Date.now().toString(36) + ext.toLowerCase();
+}
+
+function _burnExt(name) {
+  var m = String(name || "").toLowerCase().match(/\.([a-z0-9]{1,8})$/);
+  return m ? m[1] : "";
+}
+
+async function stripPdfMetadata(file) {
+  var PDF_STRIP_MAX = 25 * 1024 * 1024;
+  if ((file.size || 0) > PDF_STRIP_MAX) {
+    throw new Error("PDF too large to strip metadata in-browser (max 25 MB). Split or compress first.");
+  }
+  var buf = new Uint8Array(await file.arrayBuffer());
+  var headLen = Math.min(buf.length, 512 * 1024);
+  var head = "";
+  for (var i = 0; i < headLen; i++) head += String.fromCharCode(buf[i]);
+  if (/\/Encrypt[\s\/\[]/.test(head)) {
+    throw new Error("Encrypted PDF refused — decrypt locally first so metadata can be stripped.");
+  }
+  var magic = String.fromCharCode(buf[0] || 0, buf[1] || 0, buf[2] || 0, buf[3] || 0, buf[4] || 0);
+  if (magic !== "%PDF-" && _burnExt(file.name) !== "pdf" && (file.type || "") !== "application/pdf") {
+    throw new Error("Not a valid PDF — refused.");
+  }
+  var text = head;
+  if (buf.length > headLen) {
+    for (var j = headLen; j < buf.length; j++) text += String.fromCharCode(buf[j]);
+  }
+  var orig = text;
+  text = text.replace(/<\?xpacket begin[\s\S]*?<\?xpacket end[^?]*\?>/g, "");
+  text = text.replace(/\/Info\s*\d+\s+\d+\s+R/g, "");
+  text = text.replace(/\/Info\s*<<[\s\S]*?>>/g, "");
+  text = text.replace(/\/(Author|Title|Subject|Creator|Producer|Keywords|CreationDate|ModDate)\s*\((?:\\.|[^\\)])*\)/g, "");
+  text = text.replace(/\/(Author|Title|Subject|Creator|Producer|Keywords)\s*<[0-9A-Fa-f]*>/g, "");
+  if (text === orig && /\/Info\b/.test(orig) && /\/(Author|Producer|Creator|CreationDate)\b/.test(orig)) {
+    throw new Error("Could not strip PDF metadata — file refused.");
+  }
+  var out = new Uint8Array(text.length);
+  for (var k = 0; k < text.length; k++) out[k] = text.charCodeAt(k) & 0xff;
+  return new File([out], "doc-" + Date.now() + ".pdf", { type: "application/pdf", lastModified: Date.now() });
+}
+
+async function stripAudioMetadata(file) {
+  var buf = new Uint8Array(await file.arrayBuffer());
+  var start = 0;
+  var end = buf.length;
+  if (end - start >= 10 && buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) {
+    var size = ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
+    var footer = (buf[5] & 0x10) ? 10 : 0;
+    start = Math.min(end, 10 + size + footer);
+  }
+  if (end - start >= 128) {
+    var tpos = end - 128;
+    if (buf[tpos] === 0x54 && buf[tpos + 1] === 0x41 && buf[tpos + 2] === 0x47) end = tpos;
+  }
+  if (end - start >= 32) {
+    var ap = end - 32;
+    var tag = String.fromCharCode(buf[ap], buf[ap + 1], buf[ap + 2], buf[ap + 3], buf[ap + 4], buf[ap + 5], buf[ap + 6], buf[ap + 7]);
+    if (tag === "APETAGEX") {
+      var apeSize = buf[ap + 12] | (buf[ap + 13] << 8) | (buf[ap + 14] << 16) | (buf[ap + 15] << 24);
+      var apeFlags = buf[ap + 20] | (buf[ap + 21] << 8) | (buf[ap + 22] << 16) | (buf[ap + 23] << 24);
+      var hasHeader = (apeFlags & (1 << 31)) !== 0;
+      var block = 32 + apeSize + (hasHeader ? 32 : 0);
+      if (block > 0 && block < end - start) end -= block;
+    }
+  }
+  var ext = _burnExt(file.name);
+  var type = file.type || "";
+  var slice = buf.subarray(start, end);
+  if ((type === "audio/wav" || type === "audio/x-wav" || ext === "wav") && slice.length > 12) {
+    try { slice = _stripRiffListInfo(slice); } catch (e) {}
+  }
+  return new File([slice], "audio-" + Date.now() + (ext ? "." + ext : ""), {
+    type: type || "application/octet-stream",
+    lastModified: Date.now(),
+  });
+}
+
+function _stripRiffListInfo(buf) {
+  if (buf.length < 12) return buf;
+  if (String.fromCharCode(buf[0], buf[1], buf[2], buf[3]) !== "RIFF") return buf;
+  var outChunks = [];
+  var offset = 12;
+  while (offset + 8 <= buf.length) {
+    var id = String.fromCharCode(buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]);
+    var sz = buf[offset + 4] | (buf[offset + 5] << 8) | (buf[offset + 6] << 16) | (buf[offset + 7] << 24);
+    if (sz < 0 || offset + 8 + sz > buf.length) break;
+    var advance = 8 + sz + (sz & 1);
+    var listType = "";
+    if (id === "LIST" && sz >= 4) {
+      listType = String.fromCharCode(buf[offset + 8], buf[offset + 9], buf[offset + 10], buf[offset + 11]);
+    }
+    if (!(id === "LIST" && listType === "INFO")) {
+      outChunks.push(buf.subarray(offset, Math.min(offset + advance, buf.length)));
+    }
+    offset += advance;
+  }
+  var bodyLen = 4;
+  outChunks.forEach(function (c) { bodyLen += c.length; });
+  var out = new Uint8Array(8 + bodyLen);
+  out[0] = 0x52; out[1] = 0x49; out[2] = 0x46; out[3] = 0x46;
+  out[4] = bodyLen & 0xff; out[5] = (bodyLen >> 8) & 0xff;
+  out[6] = (bodyLen >> 16) & 0xff; out[7] = (bodyLen >> 24) & 0xff;
+  out.set(buf.subarray(8, 12), 8);
+  var pos = 12;
+  outChunks.forEach(function (c) { out.set(c, pos); pos += c.length; });
+  return out;
+}
+
+async function stripVideoMetadata(file) {
+  var buf = new Uint8Array(await file.arrayBuffer());
+  if (buf.length < 16) throw new Error("Media file too small — refused.");
+  var ext = _burnExt(file.name);
+  var type = file.type || "";
+  var isBmff = false;
+  if (buf.length > 8) {
+    var t4 = String.fromCharCode(buf[4], buf[5], buf[6], buf[7]);
+    if (t4 === "ftyp" || t4 === "wide" || t4 === "free" || t4 === "mdat" || t4 === "moov") isBmff = true;
+  }
+  if (!isBmff) {
+    return new File([buf], "video-" + Date.now() + (ext ? "." + ext : ""), {
+      type: type || "application/octet-stream",
+      lastModified: Date.now(),
+    });
+  }
+  var cleaned = _bmffStripMeta(buf);
+  if (!cleaned || cleaned.length < 16) {
+    throw new Error("Could not strip video metadata — file refused.");
+  }
+  return new File([cleaned], "video-" + Date.now() + (ext ? "." + ext : ".mp4"), {
+    type: type || "video/mp4",
+    lastModified: Date.now(),
+  });
+}
+
+function _bmffStripMeta(buf) {
+  var DROP = { meta: 1, uuid: 1, udta: 1 };
+  function walk(start, end) {
+    var chunks = [];
+    var off = start;
+    while (off + 8 <= end) {
+      var size = ((buf[off] << 24) | (buf[off + 1] << 16) | (buf[off + 2] << 8) | buf[off + 3]) >>> 0;
+      var type = String.fromCharCode(buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]);
+      var header = 8;
+      if (size === 1) {
+        if (off + 16 > end) break;
+        var high = ((buf[off + 8] << 24) | (buf[off + 9] << 16) | (buf[off + 10] << 8) | buf[off + 11]) >>> 0;
+        var low = ((buf[off + 12] << 24) | (buf[off + 13] << 16) | (buf[off + 14] << 8) | buf[off + 15]) >>> 0;
+        if (high !== 0) break;
+        size = low;
+        header = 16;
+      } else if (size === 0) {
+        size = end - off;
+      }
+      if (size < header || off + size > end) break;
+      if (DROP[type]) { off += size; continue; }
+      if ((type === "moov" || type === "trak" || type === "mdia" || type === "minf") && size > header) {
+        var inner = walk(off + header, off + size);
+        var ns = 8 + inner.length;
+        var box = new Uint8Array(ns);
+        box[0] = (ns >>> 24) & 0xff; box[1] = (ns >>> 16) & 0xff;
+        box[2] = (ns >>> 8) & 0xff; box[3] = ns & 0xff;
+        box[4] = buf[off + 4]; box[5] = buf[off + 5]; box[6] = buf[off + 6]; box[7] = buf[off + 7];
+        box.set(inner, 8);
+        chunks.push(box);
+      } else {
+        chunks.push(buf.subarray(off, off + size));
+      }
+      off += size;
+    }
+    var total = 0;
+    chunks.forEach(function (c) { total += c.length; });
+    var merged = new Uint8Array(total);
+    var p = 0;
+    chunks.forEach(function (c) { merged.set(c, p); p += c.length; });
+    return merged;
+  }
+  return walk(0, buf.length);
+}
+
+/** @returns {Promise<{file: File, hygiene: "stripped"|"name-only"}>} */
+async function prepareAttachmentForBurn(file) {
+  if (!file) throw new Error("No file");
+  var type = (file.type || "").toLowerCase();
+  var name = String(file.name || "").toLowerCase();
+  var ext = _burnExt(name);
+  if (type.indexOf("image/") === 0 || /^(png|jpe?g|gif|webp|bmp|svg|svgz|heic|heif)$/.test(ext)) {
+    return { file: await stripImageMetadata(file), hygiene: "stripped" };
+  }
+  if (type === "application/pdf" || ext === "pdf") {
+    return { file: await stripPdfMetadata(file), hygiene: "stripped" };
+  }
+  if (type.indexOf("audio/") === 0 || /^(mp3|wav|m4a|aac|ogg|flac|opus|wma)$/.test(ext)) {
+    return { file: await stripAudioMetadata(file), hygiene: "stripped" };
+  }
+  if (/^(mp4|mov|m4v)$/.test(ext) || type === "video/mp4" || type === "video/quicktime") {
+    return { file: await stripVideoMetadata(file), hygiene: "stripped" };
+  }
+  if (type.indexOf("video/") === 0 || /^(webm|mkv|avi)$/.test(ext)) {
+    return {
+      file: new File([file], "video-" + Date.now() + (ext ? "." + ext : ""), {
+        type: file.type || "application/octet-stream",
+        lastModified: Date.now(),
+      }),
+      hygiene: "name-only",
+    };
+  }
+  return {
+    file: new File([file], sanitizeAttachmentName(file.name), {
+      type: file.type || "application/octet-stream",
+      lastModified: Date.now(),
+    }),
+    hygiene: "name-only",
+  };
 }
 
 function insertImageAtCursor(file) {
@@ -1118,6 +1585,8 @@ function insertImageAtCursor(file) {
   }
   stripImageMetadata(file).then(function (clean) {
     _insertImageAtCursorClean(clean);
+  }).catch(function (err) {
+    toast((err && err.message) || "Image refused", "err");
   });
 }
 
@@ -1180,40 +1649,53 @@ function filesForUpload() {
 function createFree() {
   const err = validateFilesAgainstPlan();
   if (err) { toast(err, "warn"); return; }
-  const fd = new FormData();
-  fd.append("plan", selectedPlanId);
-  filesForUpload().forEach(function (f) { fd.append("files", f); });
-  if ($("#opt-burn-after").is(":checked")) fd.append("burn_after", "1");
-  fd.append("allow_view", $("#opt-allow-view").is(":checked") ? "1" : "0");
-  fd.append("allow_download", $("#opt-allow-download").is(":checked") ? "1" : "0");
   const planForPw = TIERS[selectedPlanId] || {};
-  const pw = (planForPw.password ? ($("#opt-password").val() || "").trim() : "");
-  if (pw) fd.append("password", pw);
-  const $btn = $("#btn-burn-go").prop("disabled", true).text("Publishing…");
-  $.ajax({
-    url: "/api/burn/create",
-    method: "POST",
-    data: fd,
-    processData: false,
-    contentType: false,
-    headers: ajaxHeaders(),
-  })
-    .done(function (data) {
-      $btn.prop("disabled", false).text("Publish");
-      if (!data.success) { toast(data.error || "Failed", "err"); return; }
-      toast("Published — link is live", "ok");
-      selectedFiles = [];
-      renderFileList();
-      showActive(data);
-      /* stay on /burn — public path is share link only */
-history.replaceState({}, "", "/burn");
+  const pw = ($("#opt-password").val() || "").trim();
+  if (pw && !planForPw.password) {
+    toast("This plan does not support a passphrase", "warn");
+    return;
+  }
+  const $btn = $("#btn-burn-go").prop("disabled", true).text("Encrypting…");
+  const plainFiles = filesForUpload();
+  burnE2E_buildEnvelope(plainFiles, pw || null)
+    .then(function (env) {
+      __burnLinkKey = env.linkKeyB64 || null;
+      const fd = new FormData();
+      fd.append("plan", selectedPlanId);
+      env.files.forEach(function (f) { fd.append("files", f); });
+      if ($("#opt-burn-after").is(":checked")) fd.append("burn_after", "1");
+      fd.append("allow_view", $("#opt-allow-view").is(":checked") ? "1" : "0");
+      fd.append("allow_download", $("#opt-allow-download").is(":checked") ? "1" : "0");
+      if (pw) fd.append("password", pw);
+      fd.append("enc_meta", JSON.stringify(env.encMeta));
+      $btn.text("Publishing…");
+      return $.ajax({
+        url: "/api/burn/create",
+        method: "POST",
+        data: fd,
+        processData: false,
+        contentType: false,
+        headers: ajaxHeaders(),
+      }).then(function (data) {
+        $btn.prop("disabled", false).text("Publish");
+        if (!data.success) { toast(data.error || "Failed", "err"); return; }
+        if (__burnLinkKey) {
+          data.path = burnSharePath(data.token, __burnLinkKey);
+          data.link_key = __burnLinkKey;
+        }
+        toast("Published — encrypted end-to-end", "ok");
+        selectedFiles = [];
+        renderFileList();
+        showActive(data);
+        history.replaceState({}, "", "/burn");
+      });
     })
-    .fail(function (xhr) {
+    .catch(function (xhr) {
       $btn.prop("disabled", false).text("Publish");
       let msg = "Upload failed";
       try {
-        const b = xhr.responseJSON || JSON.parse(xhr.responseText || "{}");
-        if (b.error) msg = b.error;
+        if (xhr && xhr.responseJSON && xhr.responseJSON.error) msg = xhr.responseJSON.error;
+        else if (xhr && xhr.message) msg = xhr.message;
       } catch (e) {}
       toast(msg, "err");
     });
@@ -1281,29 +1763,41 @@ function payAndUpload() {
 
   const err = validateFilesAgainstPlan();
   if (err) { toast(err, "warn"); return; }
-  const fd = new FormData();
-  fd.append("plan", selectedPlanId);
-  if (pendingIntentId) fd.append("intent_id", pendingIntentId);
-  fd.append("tx_hash", tx);
-  filesForUpload().forEach(function (f) { fd.append("files", f); });
-  if ($("#opt-burn-after").is(":checked")) fd.append("burn_after", "1");
-  fd.append("allow_view", $("#opt-allow-view").is(":checked") ? "1" : "0");
-  fd.append("allow_download", $("#opt-allow-download").is(":checked") ? "1" : "0");
   const planForPw = TIERS[selectedPlanId] || {};
-  const pw = (planForPw.password ? ($("#opt-password").val() || "").trim() : "");
-  if (pw) fd.append("password", pw);
+  const pw = ($("#opt-password").val() || "").trim();
+  if (pw && !planForPw.password) {
+    toast("This plan does not support a passphrase", "warn");
+    return;
+  }
   const $btn = $("#btn-pay-confirm").each(function(){ setPayBtnBusy($(this), true); });
-  $.ajax({
-    url: "/api/burn/pay",
-    method: "POST",
-    data: fd,
-    processData: false,
-    contentType: false,
-    headers: ajaxHeaders(),
-  })
-    .done(function (data) {
+  $btn.each(function(){ $(this).text("Encrypting…"); });
+  const plainFiles = filesForUpload();
+  burnE2E_buildEnvelope(plainFiles, pw || null)
+    .then(function (env) {
+      __burnLinkKey = env.linkKeyB64 || null;
+      const fd = new FormData();
+      fd.append("plan", selectedPlanId);
+      if (pendingIntentId) fd.append("intent_id", pendingIntentId);
+      fd.append("tx_hash", tx);
+      env.files.forEach(function (f) { fd.append("files", f); });
+      if ($("#opt-burn-after").is(":checked")) fd.append("burn_after", "1");
+      fd.append("allow_view", $("#opt-allow-view").is(":checked") ? "1" : "0");
+      fd.append("allow_download", $("#opt-allow-download").is(":checked") ? "1" : "0");
+      if (pw) fd.append("password", pw);
+      fd.append("enc_meta", JSON.stringify(env.encMeta));
+      $btn.each(function(){ $(this).text("Verifying…"); });
+      return $.ajax({
+        url: "/api/burn/pay",
+        method: "POST",
+        data: fd,
+        processData: false,
+        contentType: false,
+        headers: ajaxHeaders(),
+      });
+    })
+    .then(function (data) {
       $btn.prop("disabled", false).text("Publish");
-      if (!data.success) {
+      if (!data || !data.success) {
         if (data.connectivity === "offline") {
           toast(data.error || "No internet connection — verify your network and try again", "err");
         } else if (data.explorer_ok === false) {
@@ -1313,9 +1807,13 @@ function payAndUpload() {
         }
         return;
       }
+      if (__burnLinkKey) {
+        data.path = burnSharePath(data.token, __burnLinkKey);
+        data.link_key = __burnLinkKey;
+      }
       closePay();
       try { sessionStorage.removeItem("ness_pay_intent_burn"); } catch (e) {}
-      toast("Payment verified · content is live", "ok");
+      toast("Payment verified · encrypted end-to-end", "ok");
       selectedFiles = [];
       renderFileList();
       showActive(data);
@@ -1907,6 +2405,109 @@ function closePublisherPreview() {
   if (typeof loadMineDrops === "function") loadMineDrops();
 }
 
+
+/** True when content DEK is wrapped with a user passphrase (not link key). */
+function burnNeedsE2EPassphrase(data) {
+  try {
+    if (!data || !data.encrypted || !data.enc_meta) return false;
+    var w = data.enc_meta.wrap || {};
+    return w.mode === "passphrase";
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Gate UI for E2E passphrase before renderDropAccess.
+ * Server view_token may already be issued (publisher); DEK still needs the passphrase.
+ */
+function showE2EPassphraseGate(token, data, viewToken) {
+  var dlPw = document.getElementById("dl-password-wrap");
+  if (dlPw) {
+    dlPw.removeAttribute("hidden");
+    dlPw.hidden = false;
+    dlPw.style.display = "flex";
+  }
+  try { bindPassphraseToggles(); } catch (e) {}
+  var dlInp = document.getElementById("dl-password");
+  if (dlInp) {
+    try { setPasswordInputVisible(dlInp, false); } catch (e) {}
+    dlInp.value = "";
+  }
+  $("#dl-files").empty();
+  $("#dl-preview").prop("hidden", true).empty();
+  $("#dl-status").text("Passphrase required to decrypt this content");
+  $("#btn-dl-unlock").off("click").on("click", function () {
+    var pw = ($("#dl-password").val() || "").trim();
+    if (!pw) { toast("Enter the passphrase", "warn"); return; }
+    var $btn = $(this).prop("disabled", true).text("Unlocking…");
+    function finish(viewTok) {
+      window.__burnUnlockPass = pw;
+      if (dlPw) {
+        dlPw.setAttribute("hidden", "");
+        dlPw.hidden = true;
+        dlPw.style.display = "none";
+      }
+      $("#dl-password").val("");
+      // Restore into local "My drops" — public links work without device ownership
+      try {
+        if (data && data.token) {
+          upsertBurnLibrary({
+            token: data.token || token,
+            plan: data.plan,
+            plan_label: data.plan_label,
+            badge_class: data.badge_class,
+            path: data.path || ("/burn/d/" + token),
+            expires_at: data.expires_at,
+            max_downloads: data.max_downloads,
+            burn_after: data.burn_after,
+            files: data.files || [],
+          });
+        } else if (token) {
+          upsertBurnLibrary({ token: token, path: "/burn/d/" + token });
+        }
+        if (typeof loadMineDrops === "function") loadMineDrops();
+      } catch (e) {}
+      // Soft server claim when drop has no owner yet (legacy)
+      try {
+        $.ajax({
+          url: "/api/burn/" + encodeURIComponent(token) + "/claim-device",
+          method: "POST",
+          data: { password: pw },
+          headers: typeof ajaxHeaders === "function" ? ajaxHeaders() : {},
+        });
+      } catch (e2) {}
+      renderDropAccess(token, data, viewTok || viewToken || "");
+      toast("Unlocked", "ok");
+      $btn.prop("disabled", false).text("Unlock");
+    }
+    // If we already have a view session (publisher-open), only need the DEK passphrase.
+    if (viewToken) {
+      finish(viewToken);
+      return;
+    }
+    unlockBurnView(token, pw)
+      .done(function (vt) {
+        if (!vt) {
+          toast("Unlock failed", "err");
+          $btn.prop("disabled", false).text("Unlock");
+          return;
+        }
+        finish(vt);
+      })
+      .fail(function (xhr) {
+        var msg = "Invalid passphrase";
+        try {
+          var b = (xhr && xhr.responseJSON) || {};
+          if (b.error) msg = b.error;
+          if (b.retry_after) msg = msg + " (" + b.retry_after + "s)";
+        } catch (e) {}
+        toast(msg, "err");
+        $btn.prop("disabled", false).text("Unlock");
+      });
+  });
+}
+
 function openPublisherPreview(token, returnTo) {
   token = token || (activeDrop && activeDrop.token);
   if (!token) {
@@ -1963,8 +2564,12 @@ function openPublisherPreview(token, returnTo) {
       if (data.badge_class || data.plan_label) {
         $("#dl-badge").attr("class", "badge " + (data.badge_class || "")).text(data.plan_label || data.plan || "Drop");
       }
-      // Same renderer as public — visitor-accurate
-      renderDropAccess(token, data, data.view_token || "");
+      // E2E passphrase still required for DEK even when publisher owns the drop
+      if (burnNeedsE2EPassphrase(data)) {
+        showE2EPassphraseGate(token, data, data.view_token || "");
+      } else {
+        renderDropAccess(token, data, data.view_token || "");
+      }
       requestAnimationFrame(function () {
         var card = document.getElementById("download-card");
         if (card && typeof card.scrollIntoView === "function") {
@@ -1999,7 +2604,7 @@ function openPublisherPreviewPublicFallback(token) {
       tick();
       timerInterval = setInterval(tick, 1000);
       var dlPw = document.getElementById("dl-password-wrap");
-      if (data.password_required === true) {
+      if (data.password_required) {
         if (dlPw) {
           dlPw.removeAttribute("hidden");
           dlPw.hidden = false;
@@ -2007,22 +2612,13 @@ function openPublisherPreviewPublicFallback(token) {
         }
         $("#dl-files").empty();
         $("#dl-preview").prop("hidden", true).empty();
-        $("#btn-dl-unlock").off("click").on("click", function () {
-          var pw = ($("#dl-password").val() || "").trim();
-          if (!pw) { toast("Enter the passphrase", "warn"); return; }
-          var $btn = $(this).prop("disabled", true).text("Unlocking…");
-          unlockBurnView(token, pw)
-            .done(function (viewToken) {
-              $btn.prop("disabled", false).text("Unlock");
-              renderDropAccess(token, data, viewToken);
-            })
-            .fail(function (xhr) {
-              $btn.prop("disabled", false).text("Unlock");
-              var msg = "Invalid passphrase";
-              try { msg = (xhr.responseJSON && xhr.responseJSON.error) || msg; } catch (e) {}
-              toast(msg, "err");
-            });
-        });
+        $("#dl-status").text("Passphrase required to view or download");
+        showE2EPassphraseGate(token, data, "");
+        return;
+      }
+      if (burnNeedsE2EPassphrase(data)) {
+        // Encrypted content but server gate not required (edge) — still need DEK
+        showE2EPassphraseGate(token, data, "");
         return;
       }
       if (dlPw) {
@@ -2089,7 +2685,8 @@ function loadDownload(token) {
         dlPw.hidden = true;
         dlPw.style.display = "none";
       }
-      if (data.password_required === true) {
+      var needsPassphrase = !!(data.password_required);
+      if (needsPassphrase) {
         if (dlPw) {
           dlPw.removeAttribute("hidden");
           dlPw.hidden = false;
@@ -2101,14 +2698,42 @@ function loadDownload(token) {
         syncPwToggleUi(document.getElementById("btn-toggle-dl-password"), false);
         $("#dl-files").empty();
         $("#dl-preview").prop("hidden", true).empty();
+        $("#dl-status").text("Passphrase required to view or download");
         $("#btn-dl-unlock").off("click").on("click", function () {
           const pw = ($("#dl-password").val() || "").trim();
           if (!pw) { toast("Enter the passphrase", "warn"); return; }
           const $btn = $(this).prop("disabled", true).text("Unlocking…");
           unlockBurnView(token, pw)
             .done(function (viewToken) {
-              $("#dl-password-wrap").prop("hidden", true);
+              if (!viewToken) {
+                toast("Unlock failed", "err");
+                return;
+              }
+              window.__burnUnlockPass = pw;
+              $("#dl-password-wrap").prop("hidden", true).hide();
               $("#dl-password").val("");
+              try {
+                upsertBurnLibrary({
+                  token: token,
+                  plan: data.plan,
+                  plan_label: data.plan_label,
+                  badge_class: data.badge_class,
+                  path: data.path || ("/burn/d/" + token),
+                  expires_at: data.expires_at,
+                  max_downloads: data.max_downloads,
+                  burn_after: data.burn_after,
+                  files: data.files || [],
+                });
+                if (typeof loadMineDrops === "function") loadMineDrops();
+              } catch (e) {}
+              try {
+                $.ajax({
+                  url: "/api/burn/" + encodeURIComponent(token) + "/claim-device",
+                  method: "POST",
+                  data: { password: pw },
+                  headers: typeof ajaxHeaders === "function" ? ajaxHeaders() : {},
+                });
+              } catch (e2) {}
               renderDropAccess(token, data, viewToken);
               toast("Unlocked", "ok");
             })
@@ -2125,12 +2750,14 @@ function loadDownload(token) {
               $btn.prop("disabled", false).text("Unlock");
             });
         });
+      } else if (burnNeedsE2EPassphrase(data)) {
+        showE2EPassphraseGate(token, data, "");
       } else {
         $("#dl-password-wrap").prop("hidden", true);
         $("#dl-password").val("");
         unlockBurnView(token, "")
           .done(function (viewToken) {
-            renderDropAccess(token, data, viewToken);
+            renderDropAccess(token, data, viewToken || "");
           })
           .fail(function () {
             renderDropAccess(token, data, "");
@@ -2168,9 +2795,67 @@ function unlockBurnView(token, password) {
 }
 
 function renderDropAccess(token, data, viewToken) {
+  window.__burnDlMeta = data;
+  window.__burnPreviewIdx = null;
+
+  function paintStatus() {
+    try {
+      var bits = [];
+      if (data && data.plan) bits.push(String(data.plan));
+      if (data && data.downloads_remaining != null) bits.push(data.downloads_remaining + " download(s) left");
+      if (data && data.expires_at) bits.push("until " + String(data.expires_at).replace("T", " ").slice(0, 16));
+      if (data && data.encrypted) bits.push("E2E");
+      if (bits.length) $("#dl-status").text(bits.join(" · "));
+      else $("#dl-status").text("Ready");
+    } catch (e) {
+      $("#dl-status").text("Ready");
+    }
+  }
+  paintStatus();
+
+  function bodyWithKey(contentKey) {
+    __burnContentKey = contentKey || null;
+    _renderDropAccessBody(token, data, viewToken);
+  }
+
+  if (data && data.encrypted && data.enc_meta) {
+    var secret = null;
+    try {
+      var mode = (data.enc_meta.wrap && data.enc_meta.wrap.mode) || "";
+      if (mode === "passphrase") {
+        secret = window.__burnUnlockPass || "";
+        if (!secret) {
+          $("#dl-status").text("Passphrase required to decrypt");
+          return;
+        }
+      } else if (mode === "link") {
+        secret = burnLinkKeyFromLocation() || data.link_key || (activeDrop && activeDrop.link_key) || __burnLinkKey;
+        if (!secret) {
+          $("#dl-status").text("Incomplete link — missing #k= key. Ask the publisher for the full URL.");
+          toast("Share link is missing the decryption key fragment (#k=)", "err");
+          return;
+        }
+      }
+      burnE2E_unwrapDek(data.enc_meta, secret)
+        .then(function (dek) {
+          try { window.__burnUnlockPass = null; } catch (e) {}
+          bodyWithKey(dek);
+        })
+        .catch(function () {
+          $("#dl-status").text("Decryption failed — wrong key or corrupted envelope");
+          toast("Cannot decrypt content", "err");
+        });
+    } catch (e) {
+      $("#dl-status").text("Decryption failed");
+    }
+    return;
+  }
+  bodyWithKey(null);
+}
+
+function _renderDropAccessBody(token, data, viewToken) {
   const $fl = $("#dl-files").empty();
   $("#dl-preview").empty().prop("hidden", true);
-  window.__burnPreviewIdx = null;
   const allowView = data.allow_view !== false;
   const allowDl = data.allow_download !== false;
   const files = data.files || [];
@@ -2217,33 +2902,37 @@ function renderDropAccess(token, data, viewToken) {
           var meta = (window.__burnDlMeta && window.__burnDlMeta.files && window.__burnDlMeta.files[idx]) || {};
           fname = meta.filename || fname;
         } catch (e) {}
-        return res.blob().then(function (blob) {
-          var a = document.createElement("a");
-          var obj = URL.createObjectURL(blob);
-          a.href = obj;
-          a.download = fname;
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          setTimeout(function () { URL.revokeObjectURL(obj); }, 2000);
-          toast("Download started", "ok");
-          // Refresh remaining slots without full page navigation
-          $.ajax({ url: "/api/burn/" + encodeURIComponent(token), headers: ajaxHeaders() })
-            .done(function (data) {
-              if (!data || !data.success) {
-                if (data && (data.status === "burned" || (data.error || "").toLowerCase().indexOf("expired") !== -1)) {
-                  $("#dl-status").text(data.error || "This drop has expired and burned");
-                  $("#dl-files").empty();
-                  $("#dl-preview").prop("hidden", true).empty();
+        return res.arrayBuffer().then(function (buf) {
+          var ready = __burnContentKey ? burnE2E_decryptBytes(buf, __burnContentKey) : Promise.resolve(buf);
+          return ready.then(function (plain) {
+            var blob = new Blob([plain]);
+            var a = document.createElement("a");
+            var obj = URL.createObjectURL(blob);
+            a.href = obj;
+            a.download = fname;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(function () { URL.revokeObjectURL(obj); }, 2000);
+            toast("Download started", "ok");
+            // Refresh remaining slots without full page navigation
+            $.ajax({ url: "/api/burn/" + encodeURIComponent(token), headers: ajaxHeaders() })
+              .done(function (data) {
+                if (!data || !data.success) {
+                  if (data && (data.status === "burned" || (data.error || "").toLowerCase().indexOf("expired") !== -1)) {
+                    $("#dl-status").text(data.error || "This drop has expired and burned");
+                    $("#dl-files").empty();
+                    $("#dl-preview").prop("hidden", true).empty();
+                  }
+                  return;
                 }
-                return;
-              }
-              window.__burnDlMeta = data;
-              var bits = [];
-              if (data.downloads_remaining != null) bits.push(data.downloads_remaining + " download(s) left");
-              bits.push(formatBytes(data.total_bytes));
-              $("#dl-status").text(bits.join(" · "));
-            });
+                window.__burnDlMeta = data;
+                var bits = [];
+                if (data.downloads_remaining != null) bits.push(data.downloads_remaining + " download(s) left");
+                bits.push(formatBytes(data.total_bytes || 0));
+                $("#dl-status").text(bits.join(" · "));
+              });
+          });
         });
       })
       .catch(function (err) {
@@ -2312,15 +3001,36 @@ async function appendInlineBlock($stack, token, file, idx, viewToken) {
   if (kind === "audio" || ct.indexOf("audio/") === 0) {
     const hold = document.createElement("div");
     block.append(hold);
-    mountWaPlayer(hold, url);
+    if (__burnContentKey) {
+      fetch(url, { headers: ajaxHeaders() }).then(function (r) { return r.arrayBuffer(); }).then(function (buf) {
+        return burnE2E_decryptBytes(buf, __burnContentKey);
+      }).then(function (plain) {
+        var blobUrl = URL.createObjectURL(new Blob([plain], { type: ct || "audio/*" }));
+        mountWaPlayer(hold, blobUrl);
+      }).catch(function () {
+        hold.textContent = "Decrypt failed";
+      });
+    } else {
+      mountWaPlayer(hold, url);
+    }
     return;
   }
   if (kind === "image" || ct.indexOf("image/") === 0) {
     const img = document.createElement("img");
     img.className = "preview-img";
-    img.src = url;
     img.alt = file.filename || "image";
     block.append(img);
+    if (__burnContentKey) {
+      fetch(url, { headers: ajaxHeaders() }).then(function (r) { return r.arrayBuffer(); }).then(function (buf) {
+        return burnE2E_decryptBytes(buf, __burnContentKey);
+      }).then(function (plain) {
+        img.src = URL.createObjectURL(new Blob([plain], { type: ct || "image/*" }));
+      }).catch(function () {
+        img.alt = "Decrypt failed";
+      });
+    } else {
+      img.src = url;
+    }
     return;
   }
   if (kind === "note" || (file.filename || "").endsWith(".html")) {
@@ -2335,7 +3045,11 @@ async function appendInlineBlock($stack, token, file, idx, viewToken) {
         block.append('<p style="color:var(--muted);font-size:0.9rem;">' + escapeHtml(msg) + "</p>");
         return;
       }
-      const html = await res.text();
+      var buf = await res.arrayBuffer();
+      if (__burnContentKey) {
+        buf = await burnE2E_decryptBytes(buf, __burnContentKey);
+      }
+      const html = new TextDecoder().decode(buf);
       const doc = new DOMParser().parseFromString(html, "text/html");
       doc.querySelectorAll("script, iframe, object, embed").forEach(function (n) { n.remove(); });
       const wrap = document.createElement("div");
@@ -2410,8 +3124,10 @@ $(function () {
   vaultBoot.then(function () {
     if (!pathTokBoot) {
       // Home first (plans + live drops). Soft-restore library; draft only if no sticky manage UI.
-      restoreBurnActive();
-      restoreBurnDraft().then(function () { /* compose only if real in-progress draft */ });
+      return hydrateBurnLibrary().then(function () {
+        restoreBurnActive();
+        return restoreBurnDraft();
+      });
     }
   });
 
@@ -2495,11 +3211,14 @@ $(function () {
         for (let i = 0; i < incoming.length; i++) {
           if (!assertCanAddFile()) break;
           let f = incoming[i];
-          if ((f.type || "").indexOf("image/") === 0) {
-            f = await stripImageMetadata(f);
-            toast("Image metadata stripped", "ok");
-          } else {
-            f = new File([f], sanitizeAttachmentName(f.name), { type: f.type, lastModified: f.lastModified });
+          try {
+            var prepared = await prepareAttachmentForBurn(f);
+            f = prepared.file;
+            if (prepared.hygiene === "stripped") toast("Metadata cleaned", "ok");
+            else toast("Filename neutralized — container metadata may remain", "warn");
+          } catch (err) {
+            toast((err && err.message) || "File refused", "err");
+            continue;
           }
           selectedFiles.push(f);
         }
@@ -2516,11 +3235,14 @@ $(function () {
       for (let i = 0; i < incoming.length; i++) {
         if (!assertCanAddFile()) break;
         let f = incoming[i];
-        if ((f.type || "").indexOf("image/") === 0) {
-          f = await stripImageMetadata(f);
-          toast("Image metadata stripped", "ok");
-        } else {
-          f = new File([f], sanitizeAttachmentName(f.name), { type: f.type, lastModified: f.lastModified });
+        try {
+          var prepared = await prepareAttachmentForBurn(f);
+          f = prepared.file;
+          if (prepared.hygiene === "stripped") toast("Metadata cleaned", "ok");
+          else toast("Filename neutralized — container metadata may remain", "warn");
+        } catch (err) {
+          toast((err && err.message) || "File refused", "err");
+          continue;
         }
         selectedFiles.push(f);
       }
@@ -2552,10 +3274,23 @@ $(function () {
   $("#btn-author-preview").on("click", function () { openAuthorPreview(); });
 
   $("#btn-burn-go").on("click", function () {
-    const t = TIERS[selectedPlanId];
-    if (!t) return;
-    if (t.price_nch > 0) openPay();
-    else createFree();
+    try {
+      const t = (typeof TIERS === "object" && TIERS) ? TIERS[selectedPlanId] : null;
+      if (!t) {
+        toast("Plan not ready — select a plan again", "warn");
+        showPlansOnly();
+        return;
+      }
+      const err = validateFilesAgainstPlan();
+      if (err) { toast(err, "warn"); return; }
+      // Re-enable if stuck from a previous interrupted publish
+      $(this).prop("disabled", false);
+      if (Number(t.price_nch) > 0) openPay();
+      else createFree();
+    } catch (e) {
+      toast("Publish failed to start — try again", "err");
+      try { console.error(e); } catch (e2) {}
+    }
   });
 
   $("#btn-pay-cancel").on("click", closePay);
@@ -2577,8 +3312,20 @@ $(function () {
     closePublisherPreview();
   });
   $("#btn-copy-link").on("click", function () {
-    const a = $("#active-link").text();
-    if (navigator.clipboard) navigator.clipboard.writeText(a).then(function () { toast("Link copied", "ok"); });
+    const a = ($("#active-link").text() || "").trim();
+    if (!a) return;
+    var hasKey = a.indexOf("#k=") !== -1;
+    var done = function () {
+      if (hasKey) toast("Link copied — keep the #k= fragment or the content cannot be decrypted", "ok");
+      else toast("Link copied", "ok");
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(a).then(done).catch(function () {
+        toast("Copy failed", "err");
+      });
+    } else {
+      toast("Clipboard unavailable", "warn");
+    }
   });
   burnRenewMode = false;
   $("#btn-renew-drop").on("click", function () {

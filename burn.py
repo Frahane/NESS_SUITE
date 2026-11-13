@@ -84,6 +84,8 @@ def _init_burn_schema(get_db=None):
         conn.execute("ALTER TABLE burn_drops ADD COLUMN allow_download INTEGER NOT NULL DEFAULT 1")
     if "creator_key" not in cols:
         conn.execute("ALTER TABLE burn_drops ADD COLUMN creator_key TEXT")
+    if "enc_meta" not in cols:
+        conn.execute("ALTER TABLE burn_drops ADD COLUMN enc_meta TEXT")
     try:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_burn_creator ON burn_drops(creator_key)"
@@ -384,6 +386,47 @@ def _reject_oversized_request(jsonify, HAS_FLASK, max_plan_bytes=None):
 
 PBKDF2_ITERATIONS = 100_000
 PBKDF2_LEGACY_ITERATIONS = 600_000  # hashes created before versioned format
+
+
+def _parse_enc_meta(raw):
+    """Validate client E2E envelope. Server never receives DEK in plaintext."""
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or int(obj.get("v") or 0) != 1:
+        return None
+    if obj.get("alg") != "AES-GCM-256":
+        return None
+    wrap = obj.get("wrap")
+    if not isinstance(wrap, dict):
+        return None
+    mode = wrap.get("mode")
+    if mode not in ("passphrase", "link"):
+        return None
+    if not wrap.get("iv") or not wrap.get("ct"):
+        return None
+    if mode == "passphrase" and (not wrap.get("salt") or not wrap.get("iters")):
+        return None
+    dumped = json.dumps(obj, separators=(",", ":"))
+    if len(dumped) > 4096:
+        return None
+    return dumped
+
+
+def _row_enc_meta(row):
+    try:
+        raw = row["enc_meta"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return None
 
 
 def _hash_password(pw: str) -> str:
@@ -824,13 +867,41 @@ def _mount_routes(app, deps):
 
         password = (request.form.get("password") or "").strip()
         pw_hash = None
-        if tier.get("password") and password:
+        if password:
+            if not tier.get("password"):
+                shutil.rmtree(ddir, ignore_errors=True)
+                return jsonify({
+                    "success": False,
+                    "error": "This plan does not support a passphrase.",
+                }), 400
             if len(password) < 4 or len(password) > 128:
                 shutil.rmtree(ddir, ignore_errors=True)
                 return jsonify({"success": False, "error": "Passphrase must be 4–128 characters."}), 400
             pw_hash = _hash_password(password)
+
+        if HAS_FLASK:
+            from flask import request as fr
+            enc_raw = fr.form.get("enc_meta")
         else:
-            pw_hash = None  # never persist passphrase on Spark/plans without it
+            enc_raw = request.form.get("enc_meta")
+        enc_meta = _parse_enc_meta(enc_raw)
+        if meta_files and not enc_meta:
+            shutil.rmtree(ddir, ignore_errors=True)
+            return jsonify({
+                "success": False,
+                "error": "Client encryption required — update your app and retry.",
+            }), 400
+        if enc_meta:
+            try:
+                mode = json.loads(enc_meta).get("wrap", {}).get("mode")
+            except Exception:
+                mode = None
+            if password and mode != "passphrase":
+                shutil.rmtree(ddir, ignore_errors=True)
+                return jsonify({"success": False, "error": "Encryption envelope mismatch"}), 400
+            if (not password) and mode != "link":
+                shutil.rmtree(ddir, ignore_errors=True)
+                return jsonify({"success": False, "error": "Encryption envelope mismatch"}), 400
 
         burn_after = 1 if tier["burn_after_download"] else (
             1 if (request.form.get("burn_after") or "") == "1" else 0
@@ -846,8 +917,8 @@ def _mount_routes(app, deps):
             """INSERT INTO burn_drops
                (public_token, plan, created_at, expires_at, max_downloads,
                 burn_after, password_hash, total_bytes, files_json, status,
-                allow_view, allow_download, creator_key)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)""",
+                allow_view, allow_download, creator_key, enc_meta)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
             (
                 token,
                 plan_id,
@@ -861,6 +932,7 @@ def _mount_routes(app, deps):
                 allow_view,
                 allow_download,
                 owner if owner != "anon" else None,
+                enc_meta,
             ),
         )
         db.commit()
@@ -1014,9 +1086,13 @@ def _mount_routes(app, deps):
         password = (request.form.get("password") or "").strip()
         pw_hash = None
         if password:
+            if not tier.get("password"):
+                return jsonify({
+                    "success": False,
+                    "error": "This plan does not support a passphrase.",
+                }), 400
             if len(password) < 4 or len(password) > 128:
                 return jsonify({"success": False, "error": "Passphrase must be 4–128 characters."}), 400
-        if password and tier.get("password"):
             pw_hash = _hash_password(password)
         burn_after = 1 if (request.form.get("burn_after") or "") == "1" else 0
 
@@ -1025,19 +1101,43 @@ def _mount_routes(app, deps):
         if not allow_view and not allow_download:
             allow_view = 1
 
+        if HAS_FLASK:
+            from flask import request as fr
+            enc_raw = fr.form.get("enc_meta")
+        else:
+            enc_raw = request.form.get("enc_meta")
+        enc_meta = _parse_enc_meta(enc_raw)
+        if meta_files and not enc_meta:
+            shutil.rmtree(ddir, ignore_errors=True)
+            return jsonify({
+                "success": False,
+                "error": "Client encryption required — update your app and retry.",
+            }), 400
+        if enc_meta:
+            try:
+                mode = json.loads(enc_meta).get("wrap", {}).get("mode")
+            except Exception:
+                mode = None
+            if password and mode != "passphrase":
+                shutil.rmtree(ddir, ignore_errors=True)
+                return jsonify({"success": False, "error": "Encryption envelope mismatch"}), 400
+            if (not password) and mode != "link":
+                shutil.rmtree(ddir, ignore_errors=True)
+                return jsonify({"success": False, "error": "Encryption envelope mismatch"}), 400
+
         try:
             db.execute(
                 """INSERT INTO burn_drops
                    (public_token, plan, created_at, expires_at, max_downloads,
                     burn_after, password_hash, transaction_hash, amount_nch,
-                    total_bytes, files_json, status, allow_view, allow_download, creator_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)""",
+                    total_bytes, files_json, status, allow_view, allow_download, creator_key, enc_meta)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
                 (
                     token, plan_id, now.isoformat(), expires.isoformat(),
                     int(tier["max_downloads"]), burn_after, pw_hash,
                     chain["txid"], int(chain["hours_received"]),
                     total, json.dumps(meta_files),
-                    allow_view, allow_download, owner,
+                    allow_view, allow_download, owner, enc_meta,
                 ),
             )
             db.commit()
@@ -1060,6 +1160,64 @@ def _mount_routes(app, deps):
             "hours_received": int(chain["hours_received"]),
             "txid": chain["txid"],
         })
+
+    @app.route("/api/burn/<token>/claim-device", methods=["POST"])
+    def api_burn_claim_device(token):
+        """Bind a drop to this device for /mine when unowned (creator_key NULL).
+
+        Requires passphrase when the drop is password-protected. Does NOT steal
+        ownership from another device — only fills a blank creator_key.
+        """
+        token = (token or "").strip()
+        if not token or len(token) < 16:
+            return jsonify({"success": False, "error": "Invalid token"}), 404
+        rate_global = deps.get("_rate_global")
+        if rate_global and not rate_global("burn_claim", limit=30, window=60):
+            return jsonify({"success": False, "error": "Service busy"}), 503
+        if not rate_ok(rate_key("burn_claim"), limit=10, window=60):
+            return jsonify({"success": False, "error": "Too many requests"}), 429
+        try:
+            owner = (client_device_id() or "anon").strip()
+        except Exception:
+            owner = "anon"
+        if owner == "anon":
+            return jsonify({"success": False, "error": "Device id required"}), 400
+        db = get_db()
+        row = db.execute(
+            "SELECT * FROM burn_drops WHERE public_token = ?", (token,)
+        ).fetchone()
+        if not row:
+            return jsonify({"success": False, "error": "Drop not found"}), 404
+        now = datetime.now(timezone.utc)
+        try:
+            exp = datetime.fromisoformat(row["expires_at"])
+        except Exception:
+            exp = now
+        if row["status"] != "active" or exp <= now:
+            return jsonify({"success": False, "error": "Expired"}), 410
+        if _row_has_password(row):
+            pw = (request.form.get("password") or "").strip()
+            if not _check_password(pw, row["password_hash"]):
+                return jsonify({"success": False, "error": "Invalid passphrase"}), 403
+        try:
+            ck = row["creator_key"]
+        except (KeyError, IndexError):
+            ck = None
+        if ck and str(ck).strip() and str(ck).strip() != owner:
+            # Already owned by another device — do not steal
+            return jsonify({
+                "success": True,
+                "claimed": False,
+                "reason": "owned_elsewhere",
+            })
+        if not ck or not str(ck).strip():
+            db.execute(
+                "UPDATE burn_drops SET creator_key = ? WHERE public_token = ? AND (creator_key IS NULL OR creator_key = '')",
+                (owner, token),
+            )
+            db.commit()
+            return jsonify({"success": True, "claimed": True})
+        return jsonify({"success": True, "claimed": True, "reason": "already_yours"})
 
     @app.route("/api/burn/<token>/publisher-open", methods=["POST"])
     def api_burn_publisher_open(token):
@@ -1152,6 +1310,8 @@ def _mount_routes(app, deps):
             "total_bytes": row["total_bytes"],
             "path": f"/burn/d/{token}",
             "publisher": True,
+            "encrypted": bool(_row_enc_meta(row)),
+            "enc_meta": _row_enc_meta(row),
         })
 
     @app.route("/api/burn/<token>", methods=["GET"])
@@ -1187,7 +1347,9 @@ def _mount_routes(app, deps):
             "downloads_remaining": max(0, row["max_downloads"] - row["download_count"]),
             "burn_after": bool(row["burn_after"]),
             # Source of truth is the stored hash (not current tier flag)
-            "password_required": _row_has_password(row),
+            "password_required": bool(_row_has_password(row)),
+            "encrypted": bool(_row_enc_meta(row)),
+            "enc_meta": _row_enc_meta(row),
             "allow_view": allow_view,
             "allow_download": allow_download,
             "files": [
@@ -1295,6 +1457,14 @@ def _mount_routes(app, deps):
             inline = (request.args.get("inline") or request.form.get("inline") or "") in ("1", "true", "yes")
         closed = row["status"] == "burned"
         valid_session = _view_session_ok(view_token, token, finishing_pack=closed)
+        # Passphrase-protected drops: every file byte requires a live view session
+        # from POST /unlock. No anonymous inline/download path.
+        if _row_has_password(row) and not valid_session:
+            return jsonify({
+                "success": False,
+                "error": "Passphrase required",
+                "password_required": True,
+            }), 403
         if closed and not valid_session:
             return jsonify({"success": False, "error": "Drop not found"}), 404
         exp = datetime.fromisoformat(row["expires_at"])
@@ -1304,8 +1474,6 @@ def _mount_routes(app, deps):
         if not closed and row["download_count"] >= row["max_downloads"]:
             return jsonify({"success": False, "error": "Access limit reached"}), 410
         if not valid_session:
-            if _row_has_password(row):
-                return jsonify({"success": False, "error": "Unlock required or session expired"}), 403
             view_token = ""
 
         try:
